@@ -1,7 +1,6 @@
-// Design tokens for the CachyOS Updater panel. Keep this in sync with the
-// palette used in the README mockup and the four semantic banner colors
-// (success/warning/error/info) that Decky's Quick Access Menu supports well
-// against its dark background.
+// Design tokens for the CachyOS Updater panel: the four semantic banner
+// colors (success/warning/error/info) that Decky's Quick Access Menu renders
+// well against its dark background, plus neutral text/surface scales.
 
 export const theme = {
   // Status colors - used for banners, badges, and text callouts.

@@ -1,6 +1,7 @@
 import { PanelSection, PanelSectionRow, ButtonItem } from "@decky/ui";
 import { useState } from "react";
 import { theme } from "../theme";
+import { DECKY_LOG_DIR, UPGRADE_LOG_DIR } from "../types";
 import * as backend from "../backend";
 
 interface PanelFooterProps {
@@ -8,19 +9,26 @@ interface PanelFooterProps {
 }
 
 export function PanelFooter({ version }: PanelFooterProps) {
-  const [diagState, setDiagState] = useState<"idle" | "copying" | "done" | "error">("idle");
+  const [diagState, setDiagState] = useState<"idle" | "copying" | "done" | "saved" | "error">("idle");
   const rowStyle: React.CSSProperties = {
-    fontSize: theme.fontSize.tiny,
-    color: theme.text.dim,
+    fontSize: theme.fontSize.small,
+    color: theme.text.muted,
+    overflowWrap: "anywhere",
   };
 
+  // The backend also writes diagnostics.json next to the upgrade logs, so
+  // the report is reachable even when the clipboard is useless in Game Mode.
   const handleCopyDiagnostics = async () => {
     setDiagState("copying");
     try {
       const info = await backend.getDiagnosticInfo();
-      await navigator.clipboard.writeText(JSON.stringify(info, null, 2));
-      setDiagState("done");
-      setTimeout(() => setDiagState("idle"), 5000);
+      try {
+        await navigator.clipboard.writeText(JSON.stringify(info, null, 2));
+        setDiagState("done");
+      } catch {
+        setDiagState("saved");
+      }
+      setTimeout(() => setDiagState("idle"), 6000);
     } catch {
       setDiagState("error");
       setTimeout(() => setDiagState("idle"), 3000);
@@ -29,23 +37,27 @@ export function PanelFooter({ version }: PanelFooterProps) {
 
   const label =
     diagState === "done"
-      ? "Copied to clipboard"
-      : diagState === "error"
-        ? "Failed to collect diagnostics"
-        : diagState === "copying"
-          ? "Collecting..."
-          : "Copy diagnostics";
+      ? `Copied - also saved to ${UPGRADE_LOG_DIR}diagnostics.json`
+      : diagState === "saved"
+        ? `Saved to ${UPGRADE_LOG_DIR}diagnostics.json`
+        : diagState === "error"
+          ? "Failed to collect diagnostics"
+          : diagState === "copying"
+            ? "Collecting..."
+            : "Copy diagnostics";
 
   return (
     <PanelSection>
       <PanelSectionRow>
-        <div style={rowStyle}>v{version} - by bassobr</div>
+        <div style={rowStyle}>CachyOS Updater v{version} - by bassobr</div>
       </PanelSectionRow>
       <PanelSectionRow>
         <div style={rowStyle}>
-          Upgrade logs: /var/log/cachyos-updater/
+          Upgrade logs: {UPGRADE_LOG_DIR}
           <br />
-          Bugs? Report at github.com/bassobr/Decky-CachyOS-Updater
+          Plugin log: {DECKY_LOG_DIR}
+          <br />
+          Bugs? github.com/bassobr/Decky-CachyOS-Updater
         </div>
       </PanelSectionRow>
       <PanelSectionRow>

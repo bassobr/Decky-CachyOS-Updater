@@ -80,26 +80,43 @@ class PluginUpdatesMixin:
     # interpolation into shell code, and it reaches bash through stdin so
     # there is no on-disk script an unprivileged user could pre-create. It
     # only copies from the root-owned staging dir.
+    # Stage into a sibling directory and swap, so a half-copied update can
+    # never leave a broken plugin behind; Decky is only restarted when the
+    # swap succeeded. rm -rf removes a planted symlink itself (never its
+    # target) and mkdir without -p refuses anything that reappears.
     _UPDATE_HANDOFF_SCRIPT = """#!/bin/bash
 sleep 1
+new="$CACHYUPD_PLUGIN_DIR.new"
+old="$CACHYUPD_PLUGIN_DIR.old"
+rm -rf "$new" "$old"
 ok=1
-for f in plugin.json package.json main.py decky.pyi; do
-    cp "$CACHYUPD_SRC/$f" "$CACHYUPD_PLUGIN_DIR/" || ok=0
-done
-for f in LICENSE README.md; do
-    cp "$CACHYUPD_SRC/$f" "$CACHYUPD_PLUGIN_DIR/" 2>/dev/null || true
-done
-mkdir -p "$CACHYUPD_PLUGIN_DIR/dist" "$CACHYUPD_PLUGIN_DIR/py_modules"
-cp "$CACHYUPD_SRC/dist/index.js" "$CACHYUPD_PLUGIN_DIR/dist/" || ok=0
-cp "$CACHYUPD_SRC/dist/index.js.map" "$CACHYUPD_PLUGIN_DIR/dist/" 2>/dev/null || true
-cp -r "$CACHYUPD_SRC/py_modules/." "$CACHYUPD_PLUGIN_DIR/py_modules/" || ok=0
+mkdir "$new" || ok=0
 if [ "$ok" = "1" ]; then
-    logger -t cachyos-updater "Plugin updated to $CACHYUPD_LABEL, restarting plugin_loader"
-else
-    logger -t cachyos-updater "Plugin update to $CACHYUPD_LABEL failed while copying files"
+    for f in plugin.json package.json main.py decky.pyi; do
+        cp "$CACHYUPD_SRC/$f" "$new/" || ok=0
+    done
+    for f in LICENSE README.md; do
+        cp "$CACHYUPD_SRC/$f" "$new/" 2>/dev/null || true
+    done
+    mkdir -p "$new/dist" "$new/py_modules" || ok=0
+    cp "$CACHYUPD_SRC/dist/index.js" "$new/dist/" || ok=0
+    cp "$CACHYUPD_SRC/dist/index.js.map" "$new/dist/" 2>/dev/null || true
+    cp -r "$CACHYUPD_SRC/py_modules/." "$new/py_modules/" || ok=0
 fi
-rm -rf "$CACHYUPD_STAGE"
-systemctl restart plugin_loader 2>/dev/null || true
+if [ "$ok" = "1" ]; then
+    mv "$CACHYUPD_PLUGIN_DIR" "$old" && mv "$new" "$CACHYUPD_PLUGIN_DIR" || ok=0
+fi
+if [ "$ok" = "1" ]; then
+    rm -rf "$old" "$CACHYUPD_STAGE"
+    logger -t cachyos-updater "Plugin updated to $CACHYUPD_LABEL, restarting plugin_loader"
+    systemctl restart plugin_loader 2>/dev/null || true
+else
+    logger -t cachyos-updater "Plugin update to $CACHYUPD_LABEL failed while staging files; keeping the installed version"
+    if [ ! -d "$CACHYUPD_PLUGIN_DIR" ] && [ -d "$old" ]; then
+        mv "$old" "$CACHYUPD_PLUGIN_DIR"
+    fi
+    rm -rf "$new" "$CACHYUPD_STAGE"
+fi
 """
 
     async def apply_plugin_update(self) -> dict:

@@ -73,14 +73,16 @@ if [ -n "$LATEST_TAG" ]; then
     # release's SHA256SUMS. The source tarball below is only a fallback.
     if curl -fsSL -o "$TMP_DIR/$ZIP_NAME" "$ASSET_BASE/$ZIP_NAME" 2>/dev/null; then
         echo "Downloaded release build."
-        if curl -fsSL -o "$TMP_DIR/SHA256SUMS" "$ASSET_BASE/SHA256SUMS" 2>/dev/null; then
-            echo "Verifying checksum..."
-            if ! (cd "$TMP_DIR" && sha256sum --check --ignore-missing SHA256SUMS); then
-                echo "Error: checksum verification failed - aborting."
-                exit 1
-            fi
-        else
-            echo "Warning: no SHA256SUMS published for $LATEST_TAG - installing unverified."
+        # Every release ships SHA256SUMS; a zip without it is not something
+        # CI produced, so refuse instead of installing unverified code.
+        if ! curl -fsSL -o "$TMP_DIR/SHA256SUMS" "$ASSET_BASE/SHA256SUMS" 2>/dev/null; then
+            echo "Error: no SHA256SUMS published for $LATEST_TAG - refusing to install unverified code."
+            exit 1
+        fi
+        echo "Verifying checksum..."
+        if ! (cd "$TMP_DIR" && sha256sum --check --ignore-missing SHA256SUMS); then
+            echo "Error: checksum verification failed - aborting."
+            exit 1
         fi
         mkdir -p "$TMP_DIR/zip"
         extract_zip "$TMP_DIR/$ZIP_NAME" "$TMP_DIR/zip"

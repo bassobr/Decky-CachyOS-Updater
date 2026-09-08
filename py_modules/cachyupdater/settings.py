@@ -86,15 +86,37 @@ def remove_private_file(directory: str, name: str):
         os.close(dfd)
 
 
+def _open_settings_nofollow():
+    """Open settings.json for reading without following symlinks: the
+    directory is user-writable and this process is root, so a planted link
+    must not make root read (and later rename) an arbitrary file."""
+    dfd = open_private_dir(settings_dir())
+    try:
+        fd = os.open(os.path.basename(SETTINGS_FILE), os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+    finally:
+        os.close(dfd)
+    return os.fdopen(fd, "r")
+
+
+def _migrate(data: dict) -> dict:
+    """Settings-format migrations for keys renamed since older releases."""
+    if "notify_mode" not in data and "gaming_only_notify" in data:
+        data = dict(data)
+        data["notify_mode"] = "gaming" if data.get("gaming_only_notify") else "all"
+    return data
+
+
 def load_settings() -> dict:
     global _last_settings_error_log
     with _settings_lock:
         try:
-            st = os.stat(SETTINGS_FILE)
+            st = os.lstat(SETTINGS_FILE)
+            if os.path.islink(SETTINGS_FILE):
+                raise ValueError("settings.json is a symlink")
             cache_key = (st.st_mtime_ns, st.st_size)
             if _settings_cache["stat"] == cache_key and _settings_cache["data"] is not None:
                 return copy.deepcopy(_settings_cache["data"])
-            with open(SETTINGS_FILE, "r") as f:
+            with _open_settings_nofollow() as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 raise ValueError("settings root is not a JSON object")
@@ -102,14 +124,16 @@ def load_settings() -> dict:
             return copy.deepcopy(DEFAULT_SETTINGS)
         except (json.JSONDecodeError, ValueError) as e:
             # A corrupt file would otherwise be silently replaced with
-            # defaults on the next save - keep the evidence and log it.
+            # defaults on the next save - keep the evidence and log it. A
+            # planted symlink is left alone (never rename through it).
             decky.logger.error(
-                f"settings.json is corrupt ({e}); backing up to settings.json.corrupt"
+                f"settings.json is unusable ({e}); backing up to settings.json.corrupt"
             )
-            try:
-                os.replace(SETTINGS_FILE, SETTINGS_FILE + ".corrupt")
-            except Exception:
-                pass
+            if not os.path.islink(SETTINGS_FILE):
+                try:
+                    os.replace(SETTINGS_FILE, SETTINGS_FILE + ".corrupt")
+                except Exception:
+                    pass
             return copy.deepcopy(DEFAULT_SETTINGS)
         except Exception as e:
             # Rate-limited: a persistent read failure (e.g. permissions)
@@ -119,8 +143,9 @@ def load_settings() -> dict:
                 _last_settings_error_log = now
                 decky.logger.error(f"Failed to read settings: {e}")
             return copy.deepcopy(DEFAULT_SETTINGS)
-        # Merge with defaults (adds new keys), then strip stale keys.
-        merged = {**DEFAULT_SETTINGS, **data}
+        # Migrate renamed keys, merge with defaults (adds new keys), then
+        # strip stale keys.
+        merged = {**DEFAULT_SETTINGS, **_migrate(data)}
         result = {k: v for k, v in merged.items() if k in DEFAULT_SETTINGS}
         _settings_cache["stat"] = cache_key
         _settings_cache["data"] = copy.deepcopy(result)

@@ -2,21 +2,30 @@ import { PanelSection, PanelSectionRow, DropdownItem, TextField, ButtonItem } fr
 import type { GamingGroup, PluginSettings } from "../types";
 import { InfoRow } from "./InfoRow";
 import { theme } from "../theme";
+import { timeUntil } from "../utils";
 
 interface SettingsSectionProps {
   settings: PluginSettings;
   intervalChoices: number[];
   gamingGroups: GamingGroup[];
+  lastCheckAt: number;
   isBusy: boolean;
   errors: Record<string, string>;
   customPatternsInput: string;
-  onCustomPatternsInput: (value: string, editing: boolean) => void;
+  customPatternsDirty: boolean;
+  onCustomPatternsInput: (value: string) => void;
   onToggleBootWake: (val: boolean) => void;
   onIntervalChange: (hours: number) => void;
-  onToggleGamingOnly: (val: boolean) => void;
+  onNotifyModeChange: (mode: string) => void;
   onSaveCustomPatterns: () => void;
   onReset: () => void;
 }
+
+const NOTIFY_OPTIONS = [
+  { data: "all", label: "All updates" },
+  { data: "gaming", label: "Gaming-relevant only" },
+  { data: "off", label: "Off" },
+];
 
 function intervalLabel(hours: number): string {
   if (hours <= 0) return "Off";
@@ -29,13 +38,15 @@ export function SettingsSection({
   settings,
   intervalChoices,
   gamingGroups,
+  lastCheckAt,
   isBusy,
   errors,
   customPatternsInput,
+  customPatternsDirty,
   onCustomPatternsInput,
   onToggleBootWake,
   onIntervalChange,
-  onToggleGamingOnly,
+  onNotifyModeChange,
   onSaveCustomPatterns,
   onReset,
 }: SettingsSectionProps) {
@@ -43,6 +54,16 @@ export function SettingsSection({
   const groupSummary = gamingGroups
     .map((g) => `${g.label}: ${g.patterns.slice(0, 4).join(", ")}${g.patterns.length > 4 ? ", …" : ""}`)
     .join(" · ");
+  const nextAt =
+    settings.check_interval_hours > 0
+      ? (lastCheckAt || Math.floor(Date.now() / 1000)) + settings.check_interval_hours * 3600
+      : 0;
+  const errorText = (key: string) =>
+    errors[key] ? (
+      <PanelSectionRow>
+        <div style={{ fontSize: theme.fontSize.small, color: theme.error.text, overflowWrap: "anywhere" }}>{errors[key]}</div>
+      </PanelSectionRow>
+    ) : null;
 
   return (
     <PanelSection title="Settings">
@@ -58,46 +79,55 @@ export function SettingsSection({
       <PanelSectionRow>
         <DropdownItem
           label="Periodic check"
-          description="Re-check while the device stays on"
+          description={nextAt ? `Next automatic check ${timeUntil(nextAt)}` : "Only on boot, wake or manually"}
           rgOptions={intervalOptions}
           selectedOption={settings.check_interval_hours}
           disabled={isBusy}
           onChange={(option: { data: number }) => onIntervalChange(option.data)}
         />
       </PanelSectionRow>
-      {errors.interval && (
+      {errorText("interval")}
+      <PanelSectionRow>
+        <DropdownItem
+          label="Notifications"
+          description={
+            settings.notify_mode === "off"
+              ? "No toasts; the panel still shows pending updates"
+              : settings.notify_mode === "gaming"
+                ? "Toast only for kernel, Mesa, Steam, gamescope, handheld drivers…"
+                : "Toast whenever new updates are found"
+          }
+          rgOptions={NOTIFY_OPTIONS}
+          selectedOption={NOTIFY_OPTIONS.some((o) => o.data === settings.notify_mode) ? settings.notify_mode : "all"}
+          disabled={isBusy}
+          onChange={(option: { data: string }) => onNotifyModeChange(option.data)}
+        />
+      </PanelSectionRow>
+      {errorText("notify_mode")}
+      <PanelSectionRow>
+        <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.muted, overflowWrap: "anywhere", paddingBottom: "4px" }}>
+          Gaming-relevant groups: {groupSummary}. All updates are still listed and installed together - pacman never
+          does partial upgrades.
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <TextField
+          label="Extra gaming-relevant packages"
+          description="Space-separated globs, e.g. heroic* lutris"
+          value={customPatternsInput}
+          disabled={isBusy}
+          onChange={(e: React.ChangeEvent<HTMLInputElement>) => onCustomPatternsInput(e.target.value)}
+          onBlur={onSaveCustomPatterns}
+        />
+      </PanelSectionRow>
+      {customPatternsDirty && (
         <PanelSectionRow>
-          <div style={{ fontSize: theme.fontSize.small, color: theme.error.text }}>{errors.interval}</div>
+          <ButtonItem layout="below" disabled={isBusy} onClick={onSaveCustomPatterns}>
+            Save patterns
+          </ButtonItem>
         </PanelSectionRow>
       )}
-      <InfoRow
-        label="Gaming-relevant only"
-        subtitle="Notify only for kernel, Mesa, Steam, gamescope, handheld drivers…"
-        explanation={`With this on, the notification toast only appears when at least one pending update matches a gaming-relevant package group. All updates are still listed and installed together - pacman never does partial upgrades. Groups: ${groupSummary}. Add your own patterns below.`}
-        checked={settings.gaming_only_notify}
-        disabled={isBusy}
-        error={errors.gaming_only}
-        onChange={onToggleGamingOnly}
-      >
-        <PanelSectionRow>
-          <TextField
-            label="Extra gaming-relevant packages"
-            description="Space-separated globs, e.g. heroic* lutris"
-            value={customPatternsInput}
-            disabled={isBusy}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) => onCustomPatternsInput(e.target.value, true)}
-            onBlur={() => {
-              onCustomPatternsInput(customPatternsInput, false);
-              onSaveCustomPatterns();
-            }}
-          />
-        </PanelSectionRow>
-        {errors.custom_patterns && (
-          <PanelSectionRow>
-            <div style={{ fontSize: theme.fontSize.small, color: theme.error.text }}>{errors.custom_patterns}</div>
-          </PanelSectionRow>
-        )}
-      </InfoRow>
+      {errorText("custom_patterns")}
       <PanelSectionRow>
         <ButtonItem layout="below" disabled={isBusy} onClick={onReset}>
           Reset settings

@@ -56,16 +56,34 @@ class SchedulerMixin:
         except Exception as e:
             decky.logger.error(f"delayed check ({trigger}) error: {e}")
 
+    async def _wait_for_network(self, max_wait: float) -> bool:
+        """Poll for a default route (cheap /proc read) instead of letting
+        pacman time out against every mirror while WiFi is still coming up."""
+        poll = max(float(C.NETWORK_POLL), 0.01)
+        waited = 0.0
+        while not self._network_online():
+            if waited >= max_wait:
+                return False
+            await asyncio.sleep(poll)
+            waited += poll
+        return True
+
     async def _run_check_with_retry(self, trigger: str) -> dict:
-        """Boot/wake checks usually race the WiFi reconnect: retry a failed
-        sync a few times before giving up until the next trigger."""
+        """Boot/wake checks usually race the WiFi reconnect: wait for the
+        network, then retry a failed sync a few times before giving up until
+        the next trigger."""
         result: dict = {}
         for attempt in range(1, C.NETWORK_RETRIES + 1):
+            if not await self._wait_for_network(C.NETWORK_WAIT_MAX):
+                decky.logger.info(f"Update check ({trigger}) skipped: no network after {C.NETWORK_WAIT_MAX}s")
+                return {"success": False, "error": "offline", "message": "No network connection."}
             # Only the first attempt is subject to the recent-check dedupe; a
             # retry exists precisely because the previous attempt just failed.
             result = await self._run_check(trigger, force=attempt > 1)
             if result.get("success") or result.get("skipped"):
                 return result
+            if result.get("error") == "offline":
+                continue  # the route vanished again: loop back to waiting
             if attempt < C.NETWORK_RETRIES:
                 decky.logger.info(
                     f"Update check ({trigger}) attempt {attempt} failed: "

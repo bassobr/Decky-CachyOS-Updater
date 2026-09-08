@@ -36,13 +36,21 @@ class SettersMixin:
             decky.logger.error(f"set_check_interval error: {e}")
             return self._unexpected_response(e)
 
-    async def set_gaming_only_notify(self, enabled: bool) -> dict:
+    async def set_notify_mode(self, mode: str) -> dict:
+        """all = toast for every new pending set, gaming = only when a
+        gaming-relevant package is among them, off = never (panel only)."""
         try:
-            settings_store.update_settings_fields(gaming_only_notify=bool(enabled))
-            decky.logger.info(f"gaming_only_notify={bool(enabled)}")
-            return {"success": True, "gaming_only_notify": bool(enabled)}
+            if mode not in C.NOTIFY_MODES:
+                return {
+                    "success": False,
+                    "error": "invalid_value",
+                    "message": f"Notification mode must be one of {', '.join(C.NOTIFY_MODES)}.",
+                }
+            settings_store.update_settings_fields(notify_mode=mode)
+            decky.logger.info(f"notify_mode={mode}")
+            return {"success": True, "notify_mode": mode}
         except Exception as e:
-            decky.logger.error(f"set_gaming_only_notify error: {e}")
+            decky.logger.error(f"set_notify_mode error: {e}")
             return self._unexpected_response(e)
 
     async def set_custom_patterns(self, patterns: str) -> dict:

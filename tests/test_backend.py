@@ -1,11 +1,11 @@
 """Backend unit tests. Run with `python3 -m pytest tests/ -q` from the repo
 root. The cachyupdater package falls back to a decky stub when the real
 module is absent, so these tests run on any machine; everything that would
-touch the system (pacman, systemd) goes through a stubbed _run_cmd."""
+touch the system (pacman, systemd, /proc, /sys) goes through a stubbed
+_run_cmd or through paths redirected into a temp dir."""
 
 import asyncio
 import base64
-import io
 import json
 import os
 import sys
@@ -33,6 +33,15 @@ def run(coro):
 
 # ---- fixtures ----
 
+def _write_route(path, online: bool):
+    header = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+    rows = "wlan0\t0000A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n"
+    if online:
+        rows = "wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n" + rows
+    with open(path, "w") as f:
+        f.write(header + rows)
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """Redirect every filesystem path the backend touches into tmp_path."""
@@ -59,11 +68,26 @@ def env(tmp_path, monkeypatch):
     fake_pacman.write_text("#!/bin/sh\nexit 0\n")
     monkeypatch.setattr(C, "PACMAN", str(fake_pacman))
 
+    # /proc and /sys stand-ins: online, no package manager running, no battery.
+    route = tmp_path / "route"
+    _write_route(route, True)
+    monkeypatch.setattr(C, "PROC_NET_ROUTE", str(route))
+    monkeypatch.setattr(C, "PROC_NET_IPV6_ROUTE", str(tmp_path / "ipv6_route_missing"))
+    proc_dir = tmp_path / "proc"
+    proc_dir.mkdir()
+    monkeypatch.setattr(C, "PROC_DIR", str(proc_dir))
+    power_dir = tmp_path / "power_supply"
+    power_dir.mkdir()
+    monkeypatch.setattr(C, "POWER_SUPPLY_DIR", str(power_dir))
+
     yield {
         "tmp": tmp_path,
         "settings_file": settings_file,
         "state_dir": state_dir,
         "pacman_db": pacman_db,
+        "route": route,
+        "proc_dir": proc_dir,
+        "power_dir": power_dir,
     }
     settings_store._settings_cache["stat"] = None
     settings_store._settings_cache["data"] = None
@@ -75,6 +99,7 @@ def plugin(env, monkeypatch):
     p._dbpath_cache = str(env["pacman_db"])
     monkeypatch.setattr(p, "_running_kernel_modules_present", lambda: True)
     monkeypatch.setattr(p, "_running_kernel", lambda: "6.17.4-2-cachyos-deckify")
+    monkeypatch.setattr(p, "_boot_time", lambda: 1000.0)  # booted long ago
     return p
 
 
@@ -106,6 +131,20 @@ def emitted(monkeypatch):
 
     monkeypatch.setattr(decky, "emit", fake_emit)
     return events
+
+
+def _add_process(env, pid, comm):
+    d = env["proc_dir"] / str(pid)
+    d.mkdir()
+    (d / "comm").write_text(comm + "\n")
+
+
+def _add_supply(env, name, kind, **attrs):
+    d = env["power_dir"] / name
+    d.mkdir()
+    (d / "type").write_text(kind + "\n")
+    for k, v in attrs.items():
+        (d / k).write_text(f"{v}\n")
 
 
 QU_OUTPUT = """pacman-mirrorlist 20260213-1 -> 20260610-1
@@ -247,6 +286,20 @@ def test_reboot_recommended():
     assert not parsing.reboot_recommended(["linux-cachyos-headers"])
 
 
+@pytest.mark.parametrize("lines,kind", [
+    ([], ""),
+    (["failed retrieving file 'core.db' from mirror : Could not resolve host: mirror.example",
+      "failed to synchronize all databases (download library error)"], "network"),
+    (["failed to synchronize all databases (unable to lock database)"], "lock"),
+    (["failed to commit transaction (conflicting files)", "foo: /usr/lib/x exists in filesystem"], "conflict"),
+    (["foo: signature from \"X\" is marginal trust", "failed to commit transaction (invalid or corrupted package (PGP signature))"], "keyring"),
+    (["Partition / too full: 100 blocks needed", "not enough free disk space"], "space"),
+    (["something completely different"], "unknown"),
+])
+def test_classify_failure(lines, kind):
+    assert parsing.classify_failure(lines) == kind
+
+
 # ---- parsing: upgrade log ----
 
 def test_parse_real_upgrade_log_complete():
@@ -293,6 +346,14 @@ def test_parse_upgrade_log_errors_and_nothing_to_do():
     assert p["nothing_to_do"]
 
 
+def test_parse_upgrade_log_keeps_last_errors():
+    lines = [f"error: failed retrieving file 'x' from mirror{i} : timeout" for i in range(12)]
+    lines.append("error: failed to synchronize all databases (download library error)")
+    p = parsing.parse_upgrade_log("\n".join(lines) + "\n")
+    assert len(p["errors"]) == 8
+    assert p["errors"][-1] == "failed to synchronize all databases (download library error)"
+
+
 def test_parse_upgrade_log_old_packages_header():
     p = parsing.parse_upgrade_log("Packages (3) a-1  b-2  c-3\n")
     assert p["total"] == 3
@@ -325,14 +386,15 @@ def test_detect_resume():
 
 def test_decide_notification():
     kw = dict(signature="abc", last_notified_signature="", last_notified_at=0, now=1000.0, remind_interval=86400)
-    assert parsing.decide_notification(1, 3, False, **kw)
-    assert parsing.decide_notification(0, 3, False, **kw)
-    assert not parsing.decide_notification(0, 3, True, **kw)          # gaming-only, nothing relevant
-    assert parsing.decide_notification(1, 3, True, **kw)
-    assert not parsing.decide_notification(1, 0, False, **kw)         # nothing pending
+    assert parsing.decide_notification(1, 3, "all", **kw)
+    assert parsing.decide_notification(0, 3, "all", **kw)
+    assert not parsing.decide_notification(0, 3, "gaming", **kw)      # gaming-only, nothing relevant
+    assert parsing.decide_notification(1, 3, "gaming", **kw)
+    assert not parsing.decide_notification(1, 3, "off", **kw)         # notifications off
+    assert not parsing.decide_notification(1, 0, "all", **kw)         # nothing pending
     # unchanged set: remind only after the interval
-    assert not parsing.decide_notification(1, 3, False, "abc", "abc", 1000.0 - 100, 1000.0, 86400)
-    assert parsing.decide_notification(1, 3, False, "abc", "abc", 1000.0 - 90000, 1000.0, 86400)
+    assert not parsing.decide_notification(1, 3, "all", "abc", "abc", 1000.0 - 100, 1000.0, 86400)
+    assert parsing.decide_notification(1, 3, "all", "abc", "abc", 1000.0 - 90000, 1000.0, 86400)
 
 
 # ---- settings / state persistence ----
@@ -348,9 +410,17 @@ def test_settings_roundtrip_merge_and_strip(env):
     settings = settings_store.load_settings()
     assert settings["check_interval_hours"] == 12
     assert "stale" not in settings
-    assert settings["gaming_only_notify"] is False
-    settings_store.update_settings_fields(gaming_only_notify=True)
-    assert settings_store.load_settings()["gaming_only_notify"] is True
+    assert settings["notify_mode"] == "all"
+    settings_store.update_settings_fields(notify_mode="gaming")
+    assert settings_store.load_settings()["notify_mode"] == "gaming"
+
+
+def test_settings_migrate_gaming_only_to_notify_mode(env):
+    env["settings_file"].write_text(json.dumps({"gaming_only_notify": True}))
+    assert settings_store.load_settings()["notify_mode"] == "gaming"
+    settings_store._settings_cache["stat"] = None
+    env["settings_file"].write_text(json.dumps({"gaming_only_notify": False}))
+    assert settings_store.load_settings()["notify_mode"] == "all"
 
 
 @pytest.mark.parametrize("content", ["{not json", json.dumps([1, 2, 3])])
@@ -358,6 +428,16 @@ def test_load_settings_corrupt_backs_up_file(env, content):
     env["settings_file"].write_text(content)
     assert settings_store.load_settings() == C.DEFAULT_SETTINGS
     assert (env["settings_file"].parent / "settings.json.corrupt").read_text() == content
+
+
+def test_load_settings_refuses_symlinked_file(env, tmp_path):
+    target = tmp_path / "secret.json"
+    target.write_text(json.dumps({"check_interval_hours": 24}))
+    os.symlink(target, env["settings_file"])
+    assert settings_store.load_settings() == C.DEFAULT_SETTINGS
+    # neither followed nor renamed away
+    assert os.path.islink(env["settings_file"]) and target.exists()
+    assert not (env["settings_file"].parent / "settings.json.corrupt").exists()
 
 
 def test_save_settings_ignores_planted_tmp_symlink(env, tmp_path):
@@ -391,13 +471,62 @@ def test_state_unreadable_falls_back_to_defaults(env):
     assert state_store.load_state() == C.DEFAULT_STATE
 
 
+def test_pending_toast_slots(env):
+    state_store.put_pending_toast("check", {"updates_count": 3}, 100.0)
+    state_store.put_pending_toast("check", {"updates_count": 4}, 200.0)   # newest wins
+    state_store.put_pending_toast("upgrade", {"state": "succeeded"}, 150.0)
+    toasts = state_store.pull_pending_toasts(max_age=1000, now=300.0)
+    assert [t["kind"] for t in toasts] == ["upgrade", "check"]
+    assert toasts[1]["payload"]["updates_count"] == 4
+    assert state_store.pull_pending_toasts(1000, 300.0) == []             # cleared
+    state_store.put_pending_toast("check", {}, 0.0)
+    assert state_store.pull_pending_toasts(max_age=10, now=300.0) == []   # expired
+
+
+# ---- system probes ----
+
+def test_network_online_from_default_route(plugin, env):
+    assert plugin._network_online() is True
+    _write_route(env["route"], False)
+    assert plugin._network_online() is False
+    with open(env["tmp"] / "ipv6_route_missing", "w") as f:
+        f.write("00000000000000000000000000000000 00 00000000000000000000000000000000 00 "
+                "fe800000000000000000000000000001 00000400 00000001 00000000 00000003 wlan0\n")
+    assert plugin._network_online() is True
+
+
+def test_power_state(plugin, env):
+    assert plugin._power_state() == {"battery_percent": None, "on_ac": None, "low_battery": False}
+    _add_supply(env, "BAT1", "Battery", capacity=15, status="Discharging")
+    _add_supply(env, "ACAD", "Mains", online=0)
+    p = plugin._power_state()
+    assert p["battery_percent"] == 15 and p["on_ac"] is False and p["low_battery"] is True
+    (env["power_dir"] / "ACAD" / "online").write_text("1\n")
+    assert plugin._power_state()["low_battery"] is False
+    (env["power_dir"] / "ACAD" / "online").write_text("0\n")
+    (env["power_dir"] / "BAT1" / "status").write_text("Charging\n")
+    p = plugin._power_state()
+    assert p["on_ac"] is True and p["low_battery"] is False
+
+
+def test_stale_lock_detection(plugin, env):
+    assert plugin._pacman_lock_is_stale() is False
+    (env["pacman_db"] / "db.lck").touch()
+    assert plugin._pacman_lock_is_stale() is True
+    _add_process(env, 4242, "pacman")
+    assert plugin._pacman_lock_is_stale() is False
+
+
 # ---- checker ----
 
-def _install_check_runner(plugin, monkeypatch, qu=QU_OUTPUT, sup=SUP_OUTPUT, sync_rc=0, qu_rc=0, qu_stderr=""):
+def _install_check_runner(plugin, monkeypatch, qu=QU_OUTPUT, sup=SUP_OUTPUT, sync_rc=0, qu_rc=0,
+                          qu_stderr="", sup_rc=0, sup_stderr=""):
     runner = FakeRunner()
-    runner.when(C.PACMAN, "-Sy", rc=sync_rc, stderr="error: failed retrieving file" if sync_rc else "")
+    runner.when(C.PACMAN, "-Sy", rc=sync_rc,
+                stderr="error: failed retrieving file 'core.db' from x : Could not resolve host: x\n"
+                       "error: failed to synchronize all databases (download library error)" if sync_rc else "")
     runner.when(C.PACMAN, "-Qu", stdout=qu, rc=qu_rc, stderr=qu_stderr)
-    runner.when(C.PACMAN, "-Sup", stdout=sup)
+    runner.when(C.PACMAN, "-Sup", stdout=sup, rc=sup_rc, stderr=sup_stderr)
     monkeypatch.setattr(plugin, "_run_cmd", runner)
     return runner
 
@@ -428,6 +557,14 @@ def test_prepare_check_db_repairs_too_tight_mode(plugin, env):
     assert oct(os.stat(db).st_mode & 0o777) == "0o755"
 
 
+def test_prepare_check_db_removes_stale_lock(plugin, env):
+    db = plugin._prepare_check_db()
+    stale = os.path.join(db, "db.lck")
+    open(stale, "w").close()
+    plugin._prepare_check_db()
+    assert not os.path.exists(stale)
+
+
 def test_check_updates_sync_success(plugin, env, monkeypatch):
     runner = _install_check_runner(plugin, monkeypatch)
     result = plugin._check_updates_sync()
@@ -435,19 +572,12 @@ def test_check_updates_sync_success(plugin, env, monkeypatch):
     names = [u["name"] for u in result["updates"]]
     assert names == ["pacman-mirrorlist", "which", "linux-cachyos-deckify", "mesa"]
     assert result["updates"][3]["download_size"] == 31000000
+    assert result["resolve_error"] == ""
     sync_cmd = runner.calls[0]
     assert sync_cmd[:2] == [C.PACMAN, "-Sy"]
     assert "--dbpath" in sync_cmd and sync_cmd[sync_cmd.index("--dbpath") + 1] == C.CHECK_DB_DIR
     assert "--logfile" in sync_cmd and sync_cmd[sync_cmd.index("--logfile") + 1] == "/dev/null"
     assert runner.calls[1][:4] == [C.PACMAN, "-Qu", "--dbpath", C.CHECK_DB_DIR]
-
-
-def test_prepare_check_db_removes_stale_lock(plugin, env):
-    db = plugin._prepare_check_db()
-    stale = os.path.join(db, "db.lck")
-    open(stale, "w").close()
-    plugin._prepare_check_db()
-    assert not os.path.exists(stale)
 
 
 def test_check_updates_sync_no_updates_exit_1(plugin, env, monkeypatch):
@@ -460,10 +590,21 @@ def test_check_updates_sync_no_updates_exit_1(plugin, env, monkeypatch):
 def test_check_updates_sync_failures(plugin, env, monkeypatch):
     _install_check_runner(plugin, monkeypatch, sync_rc=1)
     result = plugin._check_updates_sync()
-    assert not result["success"] and result["error"] == "sync_failed"
+    assert not result["success"] and result["error"] == "sync_failed" and result["kind"] == "network"
+    assert "download library error" in result["detail"]
     _install_check_runner(plugin, monkeypatch, qu="", qu_rc=1, qu_stderr="error: could not open database")
     result = plugin._check_updates_sync()
     assert not result["success"] and result["error"] == "query_failed"
+
+
+def test_check_updates_sync_records_resolve_error(plugin, env, monkeypatch):
+    _install_check_runner(plugin, monkeypatch, sup_rc=1,
+                          sup_stderr="error: failed to prepare transaction (could not satisfy dependencies)\n"
+                                     "error: unable to satisfy dependency 'foo' required by bar")
+    result = plugin._check_updates_sync()
+    assert result["success"] and len(result["updates"]) == 4
+    assert "unable to satisfy dependency" in result["resolve_error"]
+    assert result["updates"][0]["download_size"] == 0  # sizes unavailable
 
 
 def test_run_check_persists_state_and_notifies(plugin, env, monkeypatch, emitted):
@@ -478,6 +619,9 @@ def test_run_check_persists_state_and_notifies(plugin, env, monkeypatch, emitted
     assert emitted and emitted[-1][0] == "cachyos_updater_check"
     payload = emitted[-1][1][0]
     assert payload["notify"] and payload["relevant_names"] == ["linux-cachyos-deckify", "mesa"]
+    assert payload["notify_mode"] == "all"
+    # the toast is parked for a frontend that may not be loaded yet
+    assert state["pending_toasts"]["check"]["payload"]["updates_count"] == 4
 
     # Same set again: no second toast, state still updated.
     emitted.clear()
@@ -486,13 +630,30 @@ def test_run_check_persists_state_and_notifies(plugin, env, monkeypatch, emitted
     assert emitted[-1][1][0]["notify"] is False
 
 
-def test_run_check_gaming_only_suppresses_irrelevant(plugin, env, monkeypatch, emitted):
-    settings_store.update_settings_fields(gaming_only_notify=True)
+def test_pull_pending_notifications(plugin, env, monkeypatch, emitted):
+    _install_check_runner(plugin, monkeypatch)
+    run(plugin.check_for_updates())
+    pulled = run(plugin.pull_pending_notifications())
+    assert pulled["success"] and [t["kind"] for t in pulled["notifications"]] == ["check"]
+    assert run(plugin.pull_pending_notifications())["notifications"] == []
+    # a parked "check" toast is dropped once nothing is pending anymore
+    state_store.put_pending_toast("check", {"updates_count": 4}, time.time())
+    state_store.update_state_fields(updates=[])
+    assert run(plugin.pull_pending_notifications())["notifications"] == []
+
+
+def test_run_check_notify_modes(plugin, env, monkeypatch, emitted):
+    settings_store.update_settings_fields(notify_mode="gaming")
     _install_check_runner(plugin, monkeypatch, qu="which 2.23-1 -> 2.25-1\n", sup="which|2.25-1|16798|core\n")
     result = run(plugin.check_for_updates())
     assert result["updates_count"] == 1 and result["relevant_count"] == 0
     assert result["notify"] is False
     assert state_store.load_state()["last_notified_signature"] == ""
+    assert "check" not in state_store.load_state()["pending_toasts"]
+
+    settings_store.update_settings_fields(notify_mode="off")
+    _install_check_runner(plugin, monkeypatch)
+    assert run(plugin.check_for_updates())["notify"] is False
 
 
 def test_run_check_automatic_trigger_is_deduplicated(plugin, env, monkeypatch, emitted):
@@ -505,12 +666,27 @@ def test_run_check_automatic_trigger_is_deduplicated(plugin, env, monkeypatch, e
     assert result["success"] and not result.get("skipped")
 
 
+def test_run_check_offline_leaves_state_untouched(plugin, env, monkeypatch, emitted):
+    runner = _install_check_runner(plugin, monkeypatch)
+    state_store.update_state_fields(last_check_at=5, last_check_ok=True, updates=[{"name": "x"}])
+    _write_route(env["route"], False)
+    result = run(plugin.check_for_updates())
+    assert result["error"] == "offline" and runner.calls == []
+    state = state_store.load_state()
+    assert state["last_check_at"] == 5 and state["last_check_ok"] is True and state["updates"] == [{"name": "x"}]
+    assert emitted == []
+
+
 def test_run_check_refuses_when_pacman_locked_or_upgrading(plugin, env, monkeypatch, emitted):
     runner = _install_check_runner(plugin, monkeypatch)
     (env["pacman_db"] / "db.lck").touch()
     result = run(plugin.check_for_updates())
     assert not result["success"] and result["error"] == "pacman_locked"
+    assert result["stale_lock"] is True and "stale" in result["message"]
     assert runner.calls == []
+    _add_process(env, 77, "pacman")
+    result = run(plugin.check_for_updates())
+    assert result["stale_lock"] is False and "Another package manager" in result["message"]
     (env["pacman_db"] / "db.lck").unlink()
     state_store.update_upgrade_state(state="running")
     result = run(plugin.check_for_updates())
@@ -523,15 +699,18 @@ def test_run_check_failure_recorded(plugin, env, monkeypatch, emitted):
     assert not result["success"]
     state = state_store.load_state()
     assert state["last_check_ok"] is False
-    assert "databases" in state["last_check_error"]
+    assert "mirrors" in state["last_check_error"]
+    assert state["last_check_kind"] == "network"
+    assert "download library error" in state["last_check_detail"]
     assert emitted[-1][1][0]["success"] is False and emitted[-1][1][0]["notify"] is False
 
 
 # ---- upgrade ----
 
-def _install_upgrade_runner(plugin, monkeypatch, active="inactive", systemd_run_rc=0, props=""):
+def _install_upgrade_runner(plugin, monkeypatch, active="inactive", systemd_run_rc=0, props="", active_rc=None):
     runner = FakeRunner()
-    runner.when(C.SYSTEMCTL, "is-active", stdout=active, rc=0 if active == "active" else 3)
+    rc = active_rc if active_rc is not None else (0 if active == "active" else 3)
+    runner.when(C.SYSTEMCTL, "is-active", stdout=active, rc=rc)
     runner.when(C.SYSTEMCTL, "reset-failed")
     runner.when(C.SYSTEMCTL, "show", stdout=props)
     runner.when(C.SYSTEMD_RUN, rc=systemd_run_rc, stderr="boom" if systemd_run_rc else "")
@@ -567,10 +746,18 @@ def test_start_upgrade_refusals(plugin, env, monkeypatch, emitted):
     runner = _install_upgrade_runner(plugin, monkeypatch)
     (env["pacman_db"] / "db.lck").touch()
     result = run(plugin.start_upgrade())
-    assert result["error"] == "pacman_locked"
+    assert result["error"] == "pacman_locked" and result["stale_lock"] is True
     assert not any(c[0] == C.SYSTEMD_RUN for c in runner.calls)
     (env["pacman_db"] / "db.lck").unlink()
 
+    _write_route(env["route"], False)
+    assert run(plugin.start_upgrade())["error"] == "offline"
+    _write_route(env["route"], True)
+
+    _add_supply(env, "BAT0", "Battery", capacity=10, status="Discharging")
+    result = run(plugin.start_upgrade())
+    assert result["error"] == "low_battery" and "10%" in result["message"]
+    (env["power_dir"] / "BAT0" / "status").write_text("Charging\n")
     runner = _install_upgrade_runner(plugin, monkeypatch, active="active")
     state_store.update_upgrade_state(state="running", log_path="")
     result = run(plugin.start_upgrade())
@@ -591,12 +778,14 @@ def test_start_upgrade_refuses_during_check(plugin, env, monkeypatch):
     assert run(plugin.start_upgrade())["error"] == "check_running"
 
 
-def _seed_running_upgrade(env, log_text):
+def _seed_running_upgrade(env, log_text, started_at=None):
     os.makedirs(C.LOG_DIR, exist_ok=True)
     log_path = os.path.join(C.LOG_DIR, "upgrade-test.log")
     with open(log_path, "w") as f:
         f.write(log_text)
-    state_store.update_upgrade_state(state="running", started_at=time.time() - 30, log_path=log_path, acknowledged=False)
+    state_store.update_upgrade_state(
+        state="running", started_at=started_at or (time.time() - 30), log_path=log_path, acknowledged=False
+    )
     return log_path
 
 
@@ -620,9 +809,19 @@ def test_refresh_upgrade_state_while_running_reports_progress(plugin, env, monke
     assert emitted == []
 
 
+def test_refresh_upgrade_state_probe_failure_keeps_running(plugin, env, monkeypatch, emitted):
+    # systemctl timed out (rc -1, no output): never read that as "ended".
+    _install_upgrade_runner(plugin, monkeypatch, active="", active_rc=-1)
+    _silence_post_check(plugin, monkeypatch)
+    _seed_running_upgrade(env, REAL_UPGRADE_LOG)
+    up = run(plugin._refresh_upgrade_state())
+    assert up["state"] == "running" and emitted == []
+
+
 def test_refresh_upgrade_state_finalizes_success_with_status_file(plugin, env, monkeypatch, emitted):
     _install_upgrade_runner(plugin, monkeypatch, active="inactive")
     post_checks = _silence_post_check(plugin, monkeypatch)
+    state_store.update_state_fields(updates=[{"name": "which"}], updates_signature="sig", last_notified_signature="sig")
     _seed_running_upgrade(env, REAL_UPGRADE_LOG.replace("upgrading which...", "upgrading linux-cachyos-deckify..."))
     os.makedirs(C.RUN_DIR)
     with open(C.UPGRADE_STATUS_FILE, "w") as f:
@@ -632,15 +831,32 @@ def test_refresh_upgrade_state_finalizes_success_with_status_file(plugin, env, m
     assert up["upgraded"] == ["pacman-mirrorlist", "linux-cachyos-deckify"]
     assert up["pacnew"] == 1
     assert up["reboot_recommended"] is True and up["reboot_required"] is False
-    assert up["acknowledged"] is False
+    assert up["acknowledged"] is False and up["failure_kind"] == ""
     assert "2 packages upgraded" in up["message"]
     assert emitted[-1][0] == "cachyos_updater_upgrade"
     assert emitted[-1][1][0]["state"] == "succeeded" and emitted[-1][1][0]["reboot_recommended"]
     assert post_checks == ["post-upgrade"]
+    state = state_store.load_state()
+    # the pre-upgrade pending list is obsolete and the toast is parked
+    assert state["updates"] == [] and state["updates_signature"] == ""
+    assert state["pending_toasts"]["upgrade"]["payload"]["state"] == "succeeded"
     # idempotent: a second refresh does not emit again
     emitted.clear()
     assert run(plugin._refresh_upgrade_state())["state"] == "succeeded"
     assert emitted == []
+
+
+def test_refresh_upgrade_state_finalizes_once_under_concurrency(plugin, env, monkeypatch, emitted):
+    _install_upgrade_runner(plugin, monkeypatch, active="inactive")
+    post_checks = _silence_post_check(plugin, monkeypatch)
+    _seed_running_upgrade(env, REAL_UPGRADE_LOG)
+
+    async def both():
+        return await asyncio.gather(plugin._refresh_upgrade_state(), plugin._refresh_upgrade_state())
+
+    a, b = run(both())
+    assert a["state"] == "succeeded" and b["state"] == "succeeded"
+    assert len(emitted) == 1 and post_checks == ["post-upgrade"]
 
 
 def test_refresh_upgrade_state_uses_log_marker_without_status_file(plugin, env, monkeypatch, emitted):
@@ -661,8 +877,21 @@ def test_refresh_upgrade_state_kernel_replaced_requires_reboot(plugin, env, monk
     assert up["reboot_required"] is True and up["reboot_recommended"] is True
 
 
+def test_refresh_upgrade_state_finished_before_boot_needs_no_reboot(plugin, env, monkeypatch, emitted):
+    _install_upgrade_runner(plugin, monkeypatch, active="inactive")
+    _silence_post_check(plugin, monkeypatch)
+    monkeypatch.setattr(plugin, "_running_kernel_modules_present", lambda: False)
+    monkeypatch.setattr(plugin, "_boot_time", lambda: time.time() - 5)  # rebooted just now
+    _seed_running_upgrade(env, REAL_UPGRADE_LOG.replace("upgrading which...", "upgrading linux-cachyos-deckify..."),
+                          started_at=time.time() - 600)
+    up = run(plugin._refresh_upgrade_state())
+    assert up["state"] == "succeeded"
+    assert up["reboot_required"] is False and up["reboot_recommended"] is False
+    assert "before the last restart" in up["message"]
+
+
 def test_refresh_upgrade_state_failed_run(plugin, env, monkeypatch, emitted):
-    props = "LoadState=loaded\nActiveState=failed\nResult=exit-code\nExecMainStatus=1\n"
+    props = "LoadState=loaded\nActiveState=failed\nResult=exit-code\nExecMainStatus=1\nExecMainCode=1\n"
     _install_upgrade_runner(plugin, monkeypatch, active="failed", props=props)
     _silence_post_check(plugin, monkeypatch)
     log = (
@@ -673,17 +902,42 @@ def test_refresh_upgrade_state_failed_run(plugin, env, monkeypatch, emitted):
     up = run(plugin._refresh_upgrade_state())
     assert up["state"] == "failed" and up["exit_code"] == 1
     assert "unable to lock database" in up["message"]
+    assert up["failure_kind"] == "lock"
     assert emitted[-1][1][0]["state"] == "failed"
 
 
-def test_refresh_upgrade_state_interrupted(plugin, env, monkeypatch, emitted):
-    props = "LoadState=not-found\nActiveState=inactive\nResult=success\nExecMainStatus=0\n"
-    _install_upgrade_runner(plugin, monkeypatch, active="inactive", props=props)
+def test_refresh_upgrade_state_killed_unit_is_interrupted(plugin, env, monkeypatch, emitted):
+    props = "LoadState=loaded\nActiveState=failed\nResult=signal\nExecMainStatus=9\nExecMainCode=2\n"
+    _install_upgrade_runner(plugin, monkeypatch, active="failed", props=props)
     _silence_post_check(plugin, monkeypatch)
     _seed_running_upgrade(env, ":: Retrieving packages...\n foo-1 downloading...\n")
     up = run(plugin._refresh_upgrade_state())
     assert up["state"] == "interrupted" and up["exit_code"] is None
+
+
+def test_refresh_upgrade_state_interrupted_mentions_stale_lock(plugin, env, monkeypatch, emitted):
+    props = "LoadState=not-found\nActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainCode=0\n"
+    _install_upgrade_runner(plugin, monkeypatch, active="inactive", props=props)
+    _silence_post_check(plugin, monkeypatch)
+    (env["pacman_db"] / "db.lck").touch()
+    _seed_running_upgrade(env, ":: Retrieving packages...\n foo-1 downloading...\n")
+    up = run(plugin._refresh_upgrade_state())
+    assert up["state"] == "interrupted" and up["exit_code"] is None
+    assert "stale pacman lock" in up["message"]
     assert emitted[-1][1][0]["state"] == "interrupted"
+
+
+def test_clear_stale_pacman_lock(plugin, env, monkeypatch):
+    _install_upgrade_runner(plugin, monkeypatch, active="inactive")
+    assert run(plugin.clear_stale_pacman_lock())["success"]  # nothing to do
+    lock = env["pacman_db"] / "db.lck"
+    lock.touch()
+    _add_process(env, 99, "paru")
+    result = run(plugin.clear_stale_pacman_lock())
+    assert result["success"] is False and lock.exists()
+    import shutil
+    shutil.rmtree(env["proc_dir"] / "99")
+    assert run(plugin.clear_stale_pacman_lock())["success"] and not lock.exists()
 
 
 def test_dismiss_and_reboot_guards(plugin, env, monkeypatch, emitted):
@@ -739,8 +993,8 @@ def test_run_check_with_retry(plugin, env, monkeypatch):
     monkeypatch.setattr(C, "NETWORK_RETRY_DELAY", 0)
     monkeypatch.setattr(C, "NETWORK_RETRIES", 3)
     results = iter([
-        {"success": False, "message": "offline"},
-        {"success": False, "message": "offline"},
+        {"success": False, "message": "mirror error"},
+        {"success": False, "message": "mirror error"},
         {"success": True, "updates_count": 0},
     ])
     seen = []
@@ -766,6 +1020,28 @@ def test_run_check_with_retry(plugin, env, monkeypatch):
     assert seen == ["s"]
 
 
+def test_run_check_with_retry_waits_for_network(plugin, env, monkeypatch):
+    monkeypatch.setattr(C, "NETWORK_POLL", 0.01)
+    monkeypatch.setattr(C, "NETWORK_WAIT_MAX", 0.05)
+    online = iter([False, False, True, True])
+    monkeypatch.setattr(plugin, "_network_online", lambda: next(online, True))
+    seen = []
+
+    async def fake_run_check(trigger, force=False):
+        seen.append(trigger)
+        return {"success": True, "updates_count": 0}
+
+    monkeypatch.setattr(plugin, "_run_check", fake_run_check)
+    assert run(plugin._run_check_with_retry("boot"))["success"]
+    assert seen == ["boot"]
+
+    # never comes back: give up quietly without ever calling pacman
+    monkeypatch.setattr(plugin, "_network_online", lambda: False)
+    seen.clear()
+    result = run(plugin._run_check_with_retry("wake"))
+    assert result["error"] == "offline" and seen == []
+
+
 def test_poke_resume_respects_toggle(plugin, env, monkeypatch):
     scheduled = []
     monkeypatch.setattr(plugin, "_schedule_check", lambda trigger, delay: scheduled.append(trigger) or True)
@@ -787,7 +1063,8 @@ def test_setters_validate(plugin, env):
     assert run(plugin.set_custom_patterns("ab heroic*"))["error"] == "invalid_pattern"
     assert run(plugin.set_list_filter("gaming"))["success"]
     assert run(plugin.set_list_filter("weird"))["error"] == "invalid_value"
-    assert run(plugin.set_gaming_only_notify(True))["gaming_only_notify"] is True
+    assert run(plugin.set_notify_mode("gaming"))["notify_mode"] == "gaming"
+    assert run(plugin.set_notify_mode("loud"))["error"] == "invalid_value"
     assert run(plugin.set_check_on_boot_wake(False))["check_on_boot_wake"] is False
 
 
@@ -811,10 +1088,26 @@ def test_get_status_shape(plugin, env, monkeypatch, emitted):
     assert status["check"]["relevant_count"] == 3  # kernel, mesa + custom "which"
     assert status["check"]["updates"][0]["relevant"]
     assert status["check"]["total_download_size"] == 6631 + 16798 + 152000000 + 31000000
+    assert status["check"]["resolve_error"] == "" and status["check"]["kind"] == ""
     assert status["upgrade"]["state"] == "idle"
-    assert status["pacman_locked"] is False and status["reboot_required"] is False
+    assert status["pacman_locked"] is False and status["pacman_lock_stale"] is False
+    assert status["reboot_required"] is False
+    assert status["network_online"] is True and status["boot_time"] == 1000.0
+    assert status["power"]["low_battery"] is False
     assert status["interval_choices"] == list(C.CHECK_INTERVAL_CHOICES)
+    assert status["notify_modes"] == list(C.NOTIFY_MODES)
     assert {g["id"] for g in status["gaming_groups"]} == set(C.GAMING_PACKAGE_GROUPS)
+
+
+def test_get_diagnostic_info_writes_file(plugin, env, monkeypatch):
+    runner = FakeRunner().when(C.PACMAN, "--version", stdout="\n .--.  Pacman v7.1.0 - libalpm v16.0.1\n")
+    runner.when(C.SYSTEMCTL, "show", stdout="ActiveState=inactive\n")
+    monkeypatch.setattr(plugin, "_run_cmd", runner)
+    info = run(plugin.get_diagnostic_info())
+    assert info["pacman_version"].startswith(".--.")
+    assert info["saved_to"] == os.path.join(C.LOG_DIR, "diagnostics.json")
+    with open(info["saved_to"]) as f:
+        assert json.load(f)["plugin_version"] == info["plugin_version"]
 
 
 # ---- plugin self-update ----
@@ -848,11 +1141,15 @@ def test_apply_plugin_update_refuses_without_update_or_bad_version(plugin, monke
     assert result["success"] is False and "unexpected version" in result["message"]
 
 
-def test_handoff_script_is_fixed_text_using_env():
+def test_handoff_script_stages_swaps_and_never_restarts_on_failure():
     script = main.Plugin._UPDATE_HANDOFF_SCRIPT
     for var in ("CACHYUPD_SRC", "CACHYUPD_PLUGIN_DIR", "CACHYUPD_STAGE", "CACHYUPD_LABEL"):
-        assert f'"${var}' in script or f"${var}" in script
-    assert "py_modules" in script and "systemctl restart plugin_loader" in script
+        assert f"${var}" in script
+    assert 'new="$CACHYUPD_PLUGIN_DIR.new"' in script and 'mkdir "$new" || ok=0' in script
+    assert 'mv "$CACHYUPD_PLUGIN_DIR" "$old" && mv "$new" "$CACHYUPD_PLUGIN_DIR"' in script
+    success_branch, failure_branch = script.split("else\n", 1)
+    assert "systemctl restart plugin_loader" in success_branch
+    assert "systemctl restart plugin_loader" not in failure_branch
     assert "{" not in script.replace("${", "")  # no leftover format placeholders
 
 

@@ -83,3 +83,29 @@ def update_upgrade_state(**fields) -> dict:
         state["upgrade"] = upgrade
         save_state(state)
         return state
+
+
+def put_pending_toast(kind: str, payload: dict, created_at: float):
+    """Remember a toast until the frontend pulls it (one slot per kind, the
+    newest wins). decky.emit is fire-and-forget and the frontend is often not
+    loaded yet when the boot check or a post-reboot finalization fires."""
+    with _state_lock:
+        state = load_state()
+        toasts = dict(state.get("pending_toasts") or {})
+        toasts[kind] = {"kind": kind, "payload": payload, "created_at": created_at}
+        state["pending_toasts"] = toasts
+        save_state(state)
+
+
+def pull_pending_toasts(max_age: float, now: float) -> list:
+    """Return and clear the pending toasts, dropping expired ones."""
+    with _state_lock:
+        state = load_state()
+        toasts = state.get("pending_toasts") or {}
+        if not toasts:
+            return []
+        state["pending_toasts"] = {}
+        save_state(state)
+        fresh = [t for t in toasts.values() if now - float(t.get("created_at", 0) or 0) <= max_age]
+        fresh.sort(key=lambda t: t.get("created_at", 0))
+        return fresh

@@ -1,7 +1,9 @@
+export type NotifyMode = "all" | "gaming" | "off";
+
 export interface PluginSettings {
   check_on_boot_wake: boolean;
   check_interval_hours: number;
-  gaming_only_notify: boolean;
+  notify_mode: NotifyMode | string;
   custom_patterns: string;
   list_filter: string; // "all" | "gaming"
   distro_id: string;
@@ -24,7 +26,10 @@ export interface CheckState {
   trigger: string;
   ok: boolean;
   error: string;
+  detail: string;
   in_progress: boolean;
+  kind: string;
+  resolve_error: string;
   updates: UpdateEntry[];
   relevant_count: number;
   total_download_size: number;
@@ -61,8 +66,15 @@ export interface UpgradeInfo {
   reboot_required: boolean;
   reboot_recommended: boolean;
   message: string;
+  failure_kind: string;
   acknowledged: boolean;
   progress?: UpgradeProgress;
+}
+
+export interface PowerState {
+  battery_percent: number | null;
+  on_ac: boolean | null;
+  low_battery: boolean;
 }
 
 export interface GamingGroup {
@@ -78,12 +90,17 @@ export interface PluginStatus {
   distro_id: string;
   kernel_running: string;
   pacman_available: boolean;
+  boot_time: number;
+  network_online: boolean;
+  power: PowerState;
   settings: PluginSettings;
   check: CheckState;
   upgrade: UpgradeInfo;
   pacman_locked: boolean;
+  pacman_lock_stale: boolean;
   reboot_required: boolean;
   interval_choices: number[];
+  notify_modes: string[];
   gaming_groups: GamingGroup[];
   error?: string;
   message?: string;
@@ -122,7 +139,7 @@ export interface CheckEventPayload {
   relevant_count: number;
   relevant_names: string[];
   notify: boolean;
-  gaming_only: boolean;
+  notify_mode: string;
   message: string;
 }
 
@@ -135,7 +152,20 @@ export interface UpgradeEventPayload {
   exit_code: number | null;
 }
 
-export type BadgeStatus = "active" | "drifted" | "off" | "error" | "unknown";
+export interface PendingNotification {
+  kind: "check" | "upgrade";
+  payload: CheckEventPayload | UpgradeEventPayload;
+  created_at: number;
+}
+
+export interface PendingNotificationResult extends MethodResult {
+  notifications: PendingNotification[];
+}
+
+export interface UpgradeLogResult extends MethodResult {
+  path?: string;
+  lines?: string[];
+}
 
 // Human labels for the backend's classification groups.
 export const CATEGORY_LABELS: Record<string, string> = {
@@ -146,3 +176,6 @@ export const CATEGORY_LABELS: Record<string, string> = {
   system: "System",
   custom: "Custom",
 };
+
+export const DECKY_LOG_DIR = "~/homebrew/logs/CachyOS Updater/";
+export const UPGRADE_LOG_DIR = "/var/log/cachyos-updater/";

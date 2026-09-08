@@ -1,22 +1,21 @@
 import { PanelSection, PanelSectionRow } from "@decky/ui";
 import { theme } from "../theme";
-import { timeAgo, triggerLabel } from "../utils";
+import { timeAgo, timeUntil, triggerLabel } from "../utils";
 
 interface PanelHeaderProps {
   distroName: string;
   kernel: string;
-  version: string;
   lastCheckAt: number;
   trigger: string;
+  intervalHours: number;
+  checking: boolean;
 }
 
-export function PanelHeader({ distroName, kernel, version, lastCheckAt, trigger }: PanelHeaderProps) {
-  const rowStyle: React.CSSProperties = {
-    fontSize: theme.fontSize.tiny,
-    color: theme.text.muted,
-  };
-  const when = timeAgo(lastCheckAt);
+// Distro/kernel pill plus the single place that says when the last check
+// ran and when the next automatic one is due.
+export function PanelHeader({ distroName, kernel, lastCheckAt, trigger, intervalHours, checking }: PanelHeaderProps) {
   const via = triggerLabel(trigger);
+  const nextAt = intervalHours > 0 ? (lastCheckAt || Math.floor(Date.now() / 1000)) + intervalHours * 3600 : 0;
   return (
     <PanelSection>
       <PanelSectionRow>
@@ -34,11 +33,11 @@ export function PanelHeader({ distroName, kernel, version, lastCheckAt, trigger 
         </span>
       </PanelSectionRow>
       <PanelSectionRow>
-        <div style={rowStyle}>
-          Plugin version: {version}
-          <br />
-          Last check: {when}
-          {lastCheckAt && via ? ` (${via})` : ""}
+        <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.muted }}>
+          {checking
+            ? "Checking for updates now..."
+            : `Last check: ${timeAgo(lastCheckAt)}${lastCheckAt && via ? ` (${via})` : ""}`}
+          {nextAt ? ` · next ${timeUntil(nextAt)}` : ""}
         </div>
       </PanelSectionRow>
     </PanelSection>

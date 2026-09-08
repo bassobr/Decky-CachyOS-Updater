@@ -6,6 +6,7 @@ pacman output formats (LC_ALL=C, pacman >= 6):
   pacman -Syu --noprogressbar    see parse_upgrade_log for the markers
 """
 
+import collections
 import fnmatch
 import hashlib
 import re
@@ -180,7 +181,9 @@ def parse_upgrade_log(text: str) -> dict:
     hooks_done = 0
     hooks_total = 0
     pacnew = 0
-    errors: list[str] = []
+    # Keep the LAST errors: pacman prints one line per failed mirror and the
+    # useful summary ("failed to synchronize all databases ...") comes last.
+    errors: collections.deque = collections.deque(maxlen=8)
     upgraded: list[str] = []
     nothing_to_do = False
     exit_code = None
@@ -219,8 +222,7 @@ def parse_upgrade_log(text: str) -> dict:
             continue
         m = _ERROR_RE.match(line)
         if m:
-            if len(errors) < 8:
-                errors.append(m.group(1).strip())
+            errors.append(m.group(1).strip())
             continue
         if line.strip() == "there is nothing to do":
             nothing_to_do = True
@@ -252,12 +254,42 @@ def parse_upgrade_log(text: str) -> dict:
         "hooks_total": hooks_total,
         "percent": max(0, min(100, percent)),
         "pacnew": pacnew,
-        "errors": errors,
+        "errors": list(errors),
         "upgraded": upgraded,
         "nothing_to_do": nothing_to_do,
         "exit_code": exit_code,
         "last_line": last_line[:200],
     }
+
+
+# ---- failure classification ----
+
+# Order matters: the first matching kind wins. The kind drives the advice the
+# UI shows ("try again" vs. "this needs Desktop Mode").
+FAILURE_KINDS = [
+    ("lock", re.compile(r"unable to lock database|db\.lck", re.I)),
+    ("space", re.compile(r"not enough free disk space|no space left", re.I)),
+    ("keyring", re.compile(r"signature|keyring|PGP|marginal trust|unknown trust|invalid or corrupted", re.I)),
+    ("conflict", re.compile(
+        r"conflicting files|exists in filesystem|unresolvable package conflicts|breaks dependency|"
+        r"could not satisfy dependencies|unresolvable|removing .* breaks", re.I)),
+    ("network", re.compile(
+        r"failed retrieving file|failed to synchronize all databases|download library error|"
+        r"could not resolve host|connection timed out|failed to retrieve some files|"
+        r"transfer closed|no address record|network is unreachable|temporary failure in name resolution", re.I)),
+]
+
+
+def classify_failure(lines) -> str:
+    """Map pacman error lines to a failure kind (see FAILURE_KINDS); "" for
+    no errors, "unknown" when none of the patterns match."""
+    text = "\n".join(l for l in (lines or []) if l)
+    if not text.strip():
+        return ""
+    for kind, pattern in FAILURE_KINDS:
+        if pattern.search(text):
+            return kind
+    return "unknown"
 
 
 # ---- versions (plugin self-update) ----
@@ -303,7 +335,7 @@ def detect_resume(prev_gap: float | None, gap: float | None, threshold: float) -
 def decide_notification(
     updates_relevant_count: int,
     updates_total: int,
-    gaming_only: bool,
+    notify_mode: str,
     signature: str,
     last_notified_signature: str,
     last_notified_at: float,
@@ -311,11 +343,13 @@ def decide_notification(
     remind_interval: float,
 ) -> bool:
     """Toast when there is something new to say: the pending set changed, or
-    an unchanged set has not been mentioned for remind_interval. In gaming-
-    only mode a set without relevant packages never notifies."""
+    an unchanged set has not been mentioned for remind_interval. Mode "off"
+    never notifies; "gaming" only when relevant packages are pending."""
     if updates_total <= 0:
         return False
-    if gaming_only and updates_relevant_count <= 0:
+    if notify_mode == "off":
+        return False
+    if notify_mode == "gaming" and updates_relevant_count <= 0:
         return False
     if signature != last_notified_signature:
         return True

@@ -10,10 +10,11 @@ interface BannerProps {
   children: ReactNode;
 }
 
-// Shared banner styling for the panel's many inline notifications
-// (unknown hardware, drift alert, optimize result, backend switch
-// result, update errors, etc.). Each banner sits in its own
-// PanelSection so Decky's QAM can focus it with gamepad navigation.
+// Shared banner styling for the panel's inline notifications (upgrade
+// result, reboot hint, pacman lock, check errors). Banners are display-only:
+// the gamepad cannot focus them, so every action they announce needs a
+// ButtonItem next to them. Long unbreakable strings (mirror URLs, package
+// paths) wrap instead of widening the ~300 px panel.
 export function Banner({ variant, icon, children }: BannerProps) {
   const palette = theme[variant];
   return (
@@ -35,9 +36,9 @@ export function Banner({ variant, icon, children }: BannerProps) {
           }}
         >
           {icon !== undefined && (
-            <span style={{ fontSize: theme.fontSize.icon }}>{icon}</span>
+            <span style={{ fontSize: theme.fontSize.icon, flexShrink: 0 }}>{icon}</span>
           )}
-          <span>{children}</span>
+          <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>{children}</span>
         </div>
       </PanelSectionRow>
     </PanelSection>

@@ -88,14 +88,15 @@ function FaDownload (props) {
 const getStatus = callable("get_status");
 const checkForUpdates = callable("check_for_updates");
 const startUpgrade = callable("start_upgrade");
-callable("get_upgrade_status");
-callable("get_upgrade_log");
+const getUpgradeLog = callable("get_upgrade_log");
 const dismissUpgradeResult = callable("dismiss_upgrade_result");
 const rebootSystem = callable("reboot_system");
 const pokeResume = callable("poke_resume");
+const pullPendingNotifications = callable("pull_pending_notifications");
+const clearStaleLock = callable("clear_stale_pacman_lock");
 const setCheckOnBootWake = callable("set_check_on_boot_wake");
 const setCheckInterval = callable("set_check_interval");
-const setGamingOnlyNotify = callable("set_gaming_only_notify");
+const setNotifyMode = callable("set_notify_mode");
 const setCustomPatterns = callable("set_custom_patterns");
 const setListFilter = callable("set_list_filter");
 const resetSettings = callable("reset_settings");
@@ -103,10 +104,21 @@ const checkForPluginUpdate = callable("check_for_plugin_update");
 const applyPluginUpdate = callable("apply_plugin_update");
 const getDiagnosticInfo = callable("get_diagnostic_info");
 
-// Design tokens for the CachyOS Updater panel. Keep this in sync with the
-// palette used in the README mockup and the four semantic banner colors
-// (success/warning/error/info) that Decky's Quick Access Menu supports well
-// against its dark background.
+// Human labels for the backend's classification groups.
+const CATEGORY_LABELS = {
+    kernel: "Kernel",
+    graphics: "Graphics",
+    gaming: "Gaming",
+    handheld: "Handheld",
+    system: "System",
+    custom: "Custom",
+};
+const DECKY_LOG_DIR = "~/homebrew/logs/CachyOS Updater/";
+const UPGRADE_LOG_DIR = "/var/log/cachyos-updater/";
+
+// Design tokens for the CachyOS Updater panel: the four semantic banner
+// colors (success/warning/error/info) that Decky's Quick Access Menu renders
+// well against its dark background, plus neutral text/surface scales.
 const theme = {
     // Status colors - used for banners, badges, and text callouts.
     // Each family has text (solid), bg (panel background at ~8% alpha),
@@ -168,10 +180,11 @@ const theme = {
     },
 };
 
-// Shared banner styling for the panel's many inline notifications
-// (unknown hardware, drift alert, optimize result, backend switch
-// result, update errors, etc.). Each banner sits in its own
-// PanelSection so Decky's QAM can focus it with gamepad navigation.
+// Shared banner styling for the panel's inline notifications (upgrade
+// result, reboot hint, pacman lock, check errors). Banners are display-only:
+// the gamepad cannot focus them, so every action they announce needs a
+// ButtonItem next to them. Long unbreakable strings (mirror URLs, package
+// paths) wrap instead of widening the ~300 px panel.
 function Banner({ variant, icon, children }) {
     const palette = theme[variant];
     return (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
@@ -186,7 +199,7 @@ function Banner({ variant, icon, children }) {
                     color: palette.text,
                     width: "100%",
                     boxSizing: "border-box",
-                }, children: [icon !== undefined && (SP_JSX.jsx("span", { style: { fontSize: theme.fontSize.icon }, children: icon })), SP_JSX.jsx("span", { children: children })] }) }) }));
+                }, children: [icon !== undefined && (SP_JSX.jsx("span", { style: { fontSize: theme.fontSize.icon, flexShrink: 0 }, children: icon })), SP_JSX.jsx("span", { style: { minWidth: 0, overflowWrap: "anywhere" }, children: children })] }) }) }));
 }
 
 // Format a Unix-seconds timestamp as a relative-time string ("just now",
@@ -202,6 +215,18 @@ function timeAgo(ts) {
     if (diff < 86400)
         return `${Math.floor(diff / 3600)} hr ago`;
     return `${Math.floor(diff / 86400)}d ago`;
+}
+// Rough "in 2 hr" / "in 25 min" for a future Unix-seconds timestamp; "soon"
+// when it is already due.
+function timeUntil(ts) {
+    const diff = ts - Math.floor(Date.now() / 1000);
+    if (diff <= 60)
+        return "soon";
+    if (diff < 3600)
+        return `in ${Math.round(diff / 60)} min`;
+    if (diff < 86400)
+        return `in ${Math.round(diff / 3600)} hr`;
+    return `in ${Math.round(diff / 86400)}d`;
 }
 // Bytes -> "12.3 MiB" style string for download sizes.
 function formatBytes(bytes) {
@@ -247,36 +272,64 @@ function formatDuration(seconds) {
     const h = Math.floor(m / 60);
     return `${h} h ${m % 60} min`;
 }
+// Reject a backend call that never settles (Decky reconnect, killed
+// backend) so UI locks are always released.
+function withTimeout(promise, ms, what) {
+    return new Promise((resolve, reject) => {
+        const id = setTimeout(() => reject(new Error(`${what} timed out`)), ms);
+        promise.then((value) => {
+            clearTimeout(id);
+            resolve(value);
+        }, (err) => {
+            clearTimeout(id);
+            reject(err);
+        });
+    });
+}
+// pacman failures that need a human in Desktop Mode / a TTY, as opposed to
+// transient network or mirror problems that "Try again" solves.
+const MANUAL_INTERVENTION_RE = /conflict|exists in filesystem|unresolvable|invalid or corrupted|signature|keyring|marginal trust|not enough free disk|breaks dependency|could not satisfy/i;
+function needsManualIntervention(errors, message) {
+    return [...errors, message].some((e) => MANUAL_INTERVENTION_RE.test(e));
+}
 
-function PanelHeader({ distroName, kernel, version, lastCheckAt, trigger }) {
-    const rowStyle = {
-        fontSize: theme.fontSize.tiny,
-        color: theme.text.muted,
-    };
-    const when = timeAgo(lastCheckAt);
+// Distro/kernel pill plus the single place that says when the last check
+// ran and when the next automatic one is due.
+function PanelHeader({ distroName, kernel, lastCheckAt, trigger, intervalHours, checking }) {
     const via = triggerLabel(trigger);
+    const nextAt = intervalHours > 0 ? (lastCheckAt || Math.floor(Date.now() / 1000)) + intervalHours * 3600 : 0;
     return (SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("span", { style: {
                         fontSize: theme.fontSize.tiny,
                         background: theme.surface.md,
                         padding: "2px 8px",
                         borderRadius: theme.radius.pill,
                         color: theme.text.tertiary,
-                    }, children: [distroName && distroName !== "Unknown" ? distroName : "Unknown distro", kernel && kernel !== "unknown" ? ` · kernel ${kernel}` : ""] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["Plugin version: ", version, SP_JSX.jsx("br", {}), "Last check: ", when, lastCheckAt && via ? ` (${via})` : ""] }) })] }));
+                    }, children: [distroName && distroName !== "Unknown" ? distroName : "Unknown distro", kernel && kernel !== "unknown" ? ` · kernel ${kernel}` : ""] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.muted }, children: [checking
+                            ? "Checking for updates now..."
+                            : `Last check: ${timeAgo(lastCheckAt)}${lastCheckAt && via ? ` (${via})` : ""}`, nextAt ? ` · next ${timeUntil(nextAt)}` : ""] }) })] }));
 }
 
 function PanelFooter({ version }) {
     const [diagState, setDiagState] = SP_REACT.useState("idle");
     const rowStyle = {
-        fontSize: theme.fontSize.tiny,
-        color: theme.text.dim,
+        fontSize: theme.fontSize.small,
+        color: theme.text.muted,
+        overflowWrap: "anywhere",
     };
+    // The backend also writes diagnostics.json next to the upgrade logs, so
+    // the report is reachable even when the clipboard is useless in Game Mode.
     const handleCopyDiagnostics = async () => {
         setDiagState("copying");
         try {
             const info = await getDiagnosticInfo();
-            await navigator.clipboard.writeText(JSON.stringify(info, null, 2));
-            setDiagState("done");
-            setTimeout(() => setDiagState("idle"), 5000);
+            try {
+                await navigator.clipboard.writeText(JSON.stringify(info, null, 2));
+                setDiagState("done");
+            }
+            catch {
+                setDiagState("saved");
+            }
+            setTimeout(() => setDiagState("idle"), 6000);
         }
         catch {
             setDiagState("error");
@@ -284,41 +337,27 @@ function PanelFooter({ version }) {
         }
     };
     const label = diagState === "done"
-        ? "Copied to clipboard"
-        : diagState === "error"
-            ? "Failed to collect diagnostics"
-            : diagState === "copying"
-                ? "Collecting..."
-                : "Copy diagnostics";
-    return (SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["v", version, " - by bassobr"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["Upgrade logs: /var/log/cachyos-updater/", SP_JSX.jsx("br", {}), "Bugs? Report at github.com/bassobr/Decky-CachyOS-Updater"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: diagState === "copying", onClick: handleCopyDiagnostics, children: label }) })] }));
+        ? `Copied - also saved to ${UPGRADE_LOG_DIR}diagnostics.json`
+        : diagState === "saved"
+            ? `Saved to ${UPGRADE_LOG_DIR}diagnostics.json`
+            : diagState === "error"
+                ? "Failed to collect diagnostics"
+                : diagState === "copying"
+                    ? "Collecting..."
+                    : "Copy diagnostics";
+    return (SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["CachyOS Updater v", version, " - by bassobr"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["Upgrade logs: ", UPGRADE_LOG_DIR, SP_JSX.jsx("br", {}), "Plugin log: ", DECKY_LOG_DIR, SP_JSX.jsx("br", {}), "Bugs? github.com/bassobr/Decky-CachyOS-Updater"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: diagState === "copying", onClick: handleCopyDiagnostics, children: label }) })] }));
 }
 
-// Human labels for the backend's classification groups.
-const CATEGORY_LABELS = {
-    kernel: "Kernel",
-    graphics: "Graphics",
-    gaming: "Gaming",
-    handheld: "Handheld",
-    system: "System",
-    custom: "Custom",
-};
-
-const BADGE_STYLES = {
-    active: { background: theme.success.badgeBg, color: theme.success.text },
-    drifted: { background: theme.warning.badgeBg, color: theme.warning.text },
-    off: { background: theme.surface.md, color: theme.text.muted },
-    error: { background: theme.error.badgeBg, color: theme.error.text },
-    unknown: { background: theme.surface.md, color: theme.text.tertiary },
-};
-function StatusBadge({ badge, text }) {
-    const style = BADGE_STYLES[badge];
+// Small category chip next to a gaming-relevant package.
+function StatusBadge({ text }) {
     return (SP_JSX.jsx("span", { style: {
             fontSize: theme.fontSize.small,
             padding: "2px 6px",
             borderRadius: theme.radius.sm,
             whiteSpace: "nowrap",
-            background: style.background,
-            color: style.color,
+            flexShrink: 0,
+            background: theme.success.badgeBg,
+            color: theme.success.text,
         }, children: text }));
 }
 
@@ -326,29 +365,34 @@ const FILTER_OPTIONS = [
     { data: "all", label: "All packages" },
     { data: "gaming", label: "Gaming-relevant only" },
 ];
-const COLLAPSED_COUNT = 10;
+const INITIAL_COUNT = 10;
+const PAGE_SIZE = 20;
 // Pending updates, gaming-relevant ones first (the backend sorts them that
-// way) with a category chip. Collapsed to a handful of rows by default so
-// a 200-package sync doesn't turn the QAM into an endless scroll.
+// way) with a category chip. Rows are Focusable so the D-pad walks the list
+// and scrolls it; the list grows in pages so a 200-package sync never dumps
+// everything into the QAM at once.
 function UpdateList({ updates, filter, onFilterChange }) {
-    const [expanded, setExpanded] = SP_REACT.useState(false);
+    const [visibleCount, setVisibleCount] = SP_REACT.useState(INITIAL_COUNT);
     const shown = filter === "gaming" ? updates.filter((u) => u.relevant) : updates;
-    const visible = expanded ? shown : shown.slice(0, COLLAPSED_COUNT);
+    const visible = shown.slice(0, visibleCount);
     const hidden = shown.length - visible.length;
-    return (SP_JSX.jsxs(DFL.PanelSection, { title: `Pending updates (${updates.length})`, children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "Show", rgOptions: FILTER_OPTIONS, selectedOption: filter === "gaming" ? "gaming" : "all", onChange: (option) => onFilterChange(option.data) }) }), shown.length === 0 && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.small, color: theme.text.subtitle }, children: "No gaming-relevant packages in this batch." }) })), visible.map((u) => (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
+    return (SP_JSX.jsxs(DFL.PanelSection, { title: `Pending updates (${updates.length})`, children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "Show", rgOptions: FILTER_OPTIONS, selectedOption: filter === "gaming" ? "gaming" : "all", onChange: (option) => onFilterChange(option.data) }) }), shown.length === 0 && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.small, color: theme.text.subtitle }, children: "No gaming-relevant packages in this batch." }) })), visible.map((u) => (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs(DFL.Focusable, { style: {
                         display: "flex",
                         flexDirection: "column",
                         gap: "2px",
-                        padding: "4px 0",
+                        padding: "5px 8px",
+                        borderRadius: theme.radius.md,
                         width: "100%",
+                        boxSizing: "border-box",
                     }, children: [SP_JSX.jsxs("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "6px" }, children: [SP_JSX.jsx("span", { style: {
                                         fontSize: theme.fontSize.body,
                                         color: u.relevant ? theme.text.primary : theme.text.secondary,
                                         fontWeight: u.relevant ? 600 : 400,
+                                        minWidth: 0,
                                         overflow: "hidden",
                                         textOverflow: "ellipsis",
                                         whiteSpace: "nowrap",
-                                    }, children: u.name }), u.relevant && u.category && (SP_JSX.jsx(StatusBadge, { badge: "active", text: CATEGORY_LABELS[u.category] ?? u.category }))] }), SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.muted }, children: [u.old_version, " \u2192 ", u.new_version, u.download_size ? ` · ${formatBytes(u.download_size)}` : "", u.repo ? ` · ${u.repo}` : ""] })] }) }, u.name))), (hidden > 0 || expanded) && shown.length > COLLAPSED_COUNT && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: () => setExpanded(!expanded), children: expanded ? "Show fewer" : `Show all (${hidden} more)` }) }))] }));
+                                    }, children: u.name }), u.relevant && u.category && SP_JSX.jsx(StatusBadge, { text: CATEGORY_LABELS[u.category] ?? u.category })] }), SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.muted, overflowWrap: "anywhere" }, children: [u.old_version, " \u2192 ", u.new_version, u.download_size ? ` · ${formatBytes(u.download_size)}` : "", u.repo ? ` · ${u.repo}` : ""] })] }) }, u.name))), hidden > 0 && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs(DFL.ButtonItem, { layout: "below", onClick: () => setVisibleCount(visibleCount + PAGE_SIZE), children: ["Show ", Math.min(PAGE_SIZE, hidden), " more (", hidden, " hidden)"] }) })), hidden === 0 && shown.length > INITIAL_COUNT && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: () => setVisibleCount(INITIAL_COUNT), children: "Show fewer" }) }))] }));
 }
 
 // Live view of the running pacman transaction, fed from the log tail the
@@ -370,39 +414,86 @@ function UpgradeProgress({ upgrade }) {
     return (SP_JSX.jsxs(DFL.PanelSection, { title: "System update in progress", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ProgressBarWithInfo, { nProgress: percent, indeterminate: percent <= 2, sOperationText: label, sTimeRemaining: counts, bottomSeparator: "none" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.muted, wordBreak: "break-word" }, children: [p?.last_line ? p.last_line : "Waiting for pacman output...", elapsed ? SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx("br", {}), "Running for ", elapsed, ". Sleep is blocked until it finishes."] }) : null] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.dim }, children: "The update runs as its own system service - closing this menu, restarting Steam or Decky won't interrupt it." }) })] }));
 }
 
-function InfoRow({ label, subtitle, explanation, badge, text, checked, disabled = false, error, onChange, children, }) {
-    const showBadge = badge !== undefined && text !== undefined;
+// Everything the user sees after a run ended: the result banner with the
+// right advice, the actions that follow from it, and - after the result has
+// been dismissed - a persistent reboot reminder until the device actually
+// rebooted (finished_at newer than the current boot).
+function UpgradeResult({ upgrade, bootTime, isBusy, onDismiss, onReboot, onRetry, onShowLog }) {
+    const [showPackages, setShowPackages] = SP_REACT.useState(false);
+    if (upgrade.state === "idle" || upgrade.state === "running")
+        return null;
+    const rebootPending = (upgrade.reboot_required || upgrade.reboot_recommended) && upgrade.finished_at > 0 && upgrade.finished_at > bootTime;
+    if (upgrade.acknowledged) {
+        if (!rebootPending)
+            return null;
+        return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: upgrade.reboot_required
+                        ? "Reboot required: the running kernel was replaced by the last update."
+                        : "Reboot recommended since the last update (kernel, graphics or Steam components changed)." }), SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: onReboot, children: "Reboot now" }) }) })] }));
+    }
+    const manual = needsManualIntervention(upgrade.errors, upgrade.message);
+    const smallText = {
+        fontSize: theme.fontSize.small,
+        color: theme.text.secondary,
+        overflowWrap: "anywhere",
+    };
+    if (upgrade.state === "succeeded") {
+        const count = upgrade.upgraded.length;
+        return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsxs(Banner, { variant: rebootPending ? "warning" : "success", icon: "\u2713", children: ["Update finished: ", upgrade.message, upgrade.pacnew ? ` ${upgrade.pacnew} .pacnew file${upgrade.pacnew === 1 ? "" : "s"} to review.` : "", upgrade.reboot_required
+                            ? " The running kernel was replaced - reboot required."
+                            : upgrade.reboot_recommended
+                                ? " Kernel, graphics or Steam components changed - reboot recommended."
+                                : ""] }), SP_JSX.jsxs(DFL.PanelSection, { children: [count > 0 && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: () => setShowPackages(!showPackages), children: showPackages ? "Hide packages" : `Show ${count} upgraded package${count === 1 ? "" : "s"}` }) })), showPackages && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: smallText, children: upgrade.upgraded.join(", ") }) })), rebootPending && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: onReboot, children: "Reboot now" }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: onDismiss, children: "Dismiss" }) })] })] }));
+    }
+    const interrupted = upgrade.state === "interrupted";
+    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(Banner, { variant: interrupted ? "warning" : "error", icon: interrupted ? "⚠" : "✕", children: interrupted ? upgrade.message : `Update failed: ${upgrade.message}` }), SP_JSX.jsxs(DFL.PanelSection, { children: [upgrade.errors.length > 0 && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { ...smallText, color: theme.error.text }, children: upgrade.errors.slice(-3).map((e, i) => (SP_JSX.jsxs("div", { children: ["\u2022 ", e] }, i))) }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: smallText, children: interrupted
+                                ? "pacman did not finish (the system restarted or the service was killed). Run Check now, then install again."
+                                : manual
+                                    ? 'This needs a decision pacman cannot make on its own. Run "sudo pacman -Syu" once from Desktop Mode or a TTY (Ctrl+Alt+F3).'
+                                    : "This looks like a network or mirror problem. Check the connection and try again." }) }), !interrupted && !manual && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: onRetry, children: "Try again" }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: onShowLog, children: "Show log" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: onDismiss, children: "Dismiss" }) })] })] }));
+}
+
+// A toggle with a one-line subtitle and a longer explanation behind a
+// gamepad-focusable "What does this do?" row (a tap target inside the
+// ToggleField label would be touch-only in the QAM).
+function InfoRow({ label, subtitle, explanation, checked, disabled = false, error, onChange, children, }) {
     const [expanded, setExpanded] = SP_REACT.useState(false);
-    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: SP_JSX.jsxs("span", { style: { display: "flex", alignItems: "center", gap: "4px" }, children: [SP_JSX.jsx("span", { onClick: (e) => {
-                                    e.stopPropagation();
-                                    setExpanded(!expanded);
-                                }, style: {
-                                    display: "inline-flex",
-                                    alignItems: "center",
-                                    justifyContent: "center",
-                                    width: "16px",
-                                    height: "16px",
-                                    borderRadius: "50%",
-                                    background: expanded ? theme.info.accentBg : theme.surface.lg,
-                                    color: expanded ? theme.info.text : theme.text.tertiary,
-                                    fontSize: theme.fontSize.tiny,
-                                    fontWeight: 700,
-                                    cursor: "pointer",
-                                    flexShrink: 0,
-                                }, children: "i" }), SP_JSX.jsx("span", { children: label })] }), description: SP_JSX.jsxs("span", { style: { display: "block" }, children: [showBadge && (SP_JSX.jsx("span", { style: {
-                                    display: "flex",
-                                    justifyContent: "flex-end",
-                                    marginBottom: "4px",
-                                }, children: SP_JSX.jsx(StatusBadge, { badge: badge, text: text }) })), error ? (SP_JSX.jsx("span", { style: { color: theme.error.text }, children: error })) : (SP_JSX.jsx("span", { style: { color: theme.text.subtitle, fontSize: theme.fontSize.small }, children: subtitle }))] }), checked: checked, disabled: disabled, onChange: onChange }) }), expanded && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: label, description: error ? (SP_JSX.jsx("span", { style: { color: theme.error.text, overflowWrap: "anywhere" }, children: error })) : (SP_JSX.jsx("span", { style: { color: theme.text.subtitle, fontSize: theme.fontSize.small }, children: subtitle })), checked: checked, disabled: disabled, bottomSeparator: "none", onChange: onChange }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs(DFL.Focusable, { onActivate: () => setExpanded(!expanded), onClick: () => setExpanded(!expanded), style: {
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        padding: "4px 8px",
+                        marginBottom: "6px",
+                        borderRadius: theme.radius.md,
+                        fontSize: theme.fontSize.tiny,
+                        color: expanded ? theme.info.text : theme.text.tertiary,
+                        background: expanded ? theme.info.bg : "transparent",
+                    }, children: [SP_JSX.jsx("span", { style: {
+                                display: "inline-flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                width: "14px",
+                                height: "14px",
+                                borderRadius: "50%",
+                                background: expanded ? theme.info.accentBg : theme.surface.lg,
+                                fontWeight: 700,
+                                flexShrink: 0,
+                            }, children: "i" }), SP_JSX.jsx("span", { children: expanded ? "Hide details" : "What does this do?" })] }) }), expanded && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                         padding: "8px 12px",
+                        marginBottom: "6px",
                         background: theme.surface.xs,
                         borderRadius: theme.radius.md,
                         fontSize: theme.fontSize.small,
                         lineHeight: "1.5",
                         color: theme.text.secondary,
+                        overflowWrap: "anywhere",
                     }, children: explanation }) })), children] }));
 }
 
+const NOTIFY_OPTIONS = [
+    { data: "all", label: "All updates" },
+    { data: "gaming", label: "Gaming-relevant only" },
+    { data: "off", label: "Off" },
+];
 function intervalLabel(hours) {
     if (hours <= 0)
         return "Off";
@@ -412,30 +503,103 @@ function intervalLabel(hours) {
         return "Once a day";
     return `Every ${hours} hours`;
 }
-function SettingsSection({ settings, intervalChoices, gamingGroups, isBusy, errors, customPatternsInput, onCustomPatternsInput, onToggleBootWake, onIntervalChange, onToggleGamingOnly, onSaveCustomPatterns, onReset, }) {
+function SettingsSection({ settings, intervalChoices, gamingGroups, lastCheckAt, isBusy, errors, customPatternsInput, customPatternsDirty, onCustomPatternsInput, onToggleBootWake, onIntervalChange, onNotifyModeChange, onSaveCustomPatterns, onReset, }) {
     const intervalOptions = intervalChoices.map((h) => ({ data: h, label: intervalLabel(h) }));
     const groupSummary = gamingGroups
         .map((g) => `${g.label}: ${g.patterns.slice(0, 4).join(", ")}${g.patterns.length > 4 ? ", …" : ""}`)
         .join(" · ");
-    return (SP_JSX.jsxs(DFL.PanelSection, { title: "Settings", children: [SP_JSX.jsx(InfoRow, { label: "Check after boot & wake", subtitle: "Looks for updates when the device starts or resumes", explanation: "Runs an update check about 45 seconds after boot and about 20 seconds after the device wakes from sleep, once WiFi is back. The check downloads the package databases into a private copy (like pacman-contrib's checkupdates) and never modifies the system; a failed check is retried a few times while the network comes up.", checked: settings.check_on_boot_wake, disabled: isBusy, error: errors.boot_wake, onChange: onToggleBootWake }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "Periodic check", description: "Re-check while the device stays on", rgOptions: intervalOptions, selectedOption: settings.check_interval_hours, disabled: isBusy, onChange: (option) => onIntervalChange(option.data) }) }), errors.interval && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.small, color: theme.error.text }, children: errors.interval }) })), SP_JSX.jsxs(InfoRow, { label: "Gaming-relevant only", subtitle: "Notify only for kernel, Mesa, Steam, gamescope, handheld drivers\u2026", explanation: `With this on, the notification toast only appears when at least one pending update matches a gaming-relevant package group. All updates are still listed and installed together - pacman never does partial upgrades. Groups: ${groupSummary}. Add your own patterns below.`, checked: settings.gaming_only_notify, disabled: isBusy, error: errors.gaming_only, onChange: onToggleGamingOnly, children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.TextField, { label: "Extra gaming-relevant packages", description: "Space-separated globs, e.g. heroic* lutris", value: customPatternsInput, disabled: isBusy, onChange: (e) => onCustomPatternsInput(e.target.value, true), onBlur: () => {
-                                onCustomPatternsInput(customPatternsInput, false);
-                                onSaveCustomPatterns();
-                            } }) }), errors.custom_patterns && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.small, color: theme.error.text }, children: errors.custom_patterns }) }))] }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: onReset, children: "Reset settings" }) })] }));
+    const nextAt = settings.check_interval_hours > 0
+        ? (lastCheckAt || Math.floor(Date.now() / 1000)) + settings.check_interval_hours * 3600
+        : 0;
+    const errorText = (key) => errors[key] ? (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.small, color: theme.error.text, overflowWrap: "anywhere" }, children: errors[key] }) })) : null;
+    return (SP_JSX.jsxs(DFL.PanelSection, { title: "Settings", children: [SP_JSX.jsx(InfoRow, { label: "Check after boot & wake", subtitle: "Looks for updates when the device starts or resumes", explanation: "Runs an update check about 45 seconds after boot and about 20 seconds after the device wakes from sleep, once WiFi is back. The check downloads the package databases into a private copy (like pacman-contrib's checkupdates) and never modifies the system; a failed check is retried a few times while the network comes up.", checked: settings.check_on_boot_wake, disabled: isBusy, error: errors.boot_wake, onChange: onToggleBootWake }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "Periodic check", description: nextAt ? `Next automatic check ${timeUntil(nextAt)}` : "Only on boot, wake or manually", rgOptions: intervalOptions, selectedOption: settings.check_interval_hours, disabled: isBusy, onChange: (option) => onIntervalChange(option.data) }) }), errorText("interval"), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "Notifications", description: settings.notify_mode === "off"
+                        ? "No toasts; the panel still shows pending updates"
+                        : settings.notify_mode === "gaming"
+                            ? "Toast only for kernel, Mesa, Steam, gamescope, handheld drivers…"
+                            : "Toast whenever new updates are found", rgOptions: NOTIFY_OPTIONS, selectedOption: NOTIFY_OPTIONS.some((o) => o.data === settings.notify_mode) ? settings.notify_mode : "all", disabled: isBusy, onChange: (option) => onNotifyModeChange(option.data) }) }), errorText("notify_mode"), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.muted, overflowWrap: "anywhere", paddingBottom: "4px" }, children: ["Gaming-relevant groups: ", groupSummary, ". All updates are still listed and installed together - pacman never does partial upgrades."] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.TextField, { label: "Extra gaming-relevant packages", description: "Space-separated globs, e.g. heroic* lutris", value: customPatternsInput, disabled: isBusy, onChange: (e) => onCustomPatternsInput(e.target.value), onBlur: onSaveCustomPatterns }) }), customPatternsDirty && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: onSaveCustomPatterns, children: "Save patterns" }) })), errorText("custom_patterns"), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: onReset, children: "Reset settings" }) })] }));
 }
 
 // Self-update of the plugin itself (signed GitHub release), separate from
-// the system updates above.
-function PluginUpdatesSection({ updating, checking, info, error, onApply, onCheck }) {
-    return (SP_JSX.jsxs(DFL.PanelSection, { title: "Plugin update", children: [error && !updating && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.body, color: theme.warning.text }, children: ["\u26A0 ", error] }) })), updating ? (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: "Updating plugin... Decky will restart momentarily." }) })) : info?.update_available ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.body, color: theme.success.text }, children: ["Plugin v", info.latest_version, " available (you have v", info.current_version, ")"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: onApply, children: "Update plugin now" }) })] })) : (SP_JSX.jsxs(SP_JSX.Fragment, { children: [info && info.success === false && info.message && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.tiny, color: theme.error.text }, children: info.message }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: checking, onClick: onCheck, children: checking ? "Checking..." : info?.success && !info?.update_available ? "Plugin is up to date" : "Check for plugin update" }) })] }))] }));
+// the system updates above. Applying it restarts Decky (all plugins reload).
+function PluginUpdatesSection({ updating, checking, info, error, disabled, onApply, onCheck }) {
+    return (SP_JSX.jsxs(DFL.PanelSection, { title: "Plugin update", children: [error && !updating && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.body, color: theme.warning.text, overflowWrap: "anywhere" }, children: ["\u26A0 ", error] }) })), updating ? (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: "Updating plugin... Decky restarts in a moment, all plugins reload briefly." }) })) : info?.update_available ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.body, color: theme.success.text }, children: ["Plugin v", info.latest_version, " available (you have v", info.current_version, ")"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: disabled, onClick: onApply, children: "Update plugin now" }) }), info.release_url && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: () => DFL.Navigation.NavigateToExternalWeb(info.release_url), children: "What's new" }) }))] })) : (SP_JSX.jsxs(SP_JSX.Fragment, { children: [info && info.success === false && info.message && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.tiny, color: theme.error.text, overflowWrap: "anywhere" }, children: info.message }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: checking, onClick: onCheck, children: checking
+                                ? "Checking..."
+                                : info?.success && !info?.update_available
+                                    ? "Plugin is up to date"
+                                    : "Check for plugin update" }) })] }))] }));
+}
+
+// Read-only view of the pacman log tail for a failed or interrupted run.
+// showModal() injects closeModal.
+function LogModal({ title, path, lines, closeModal }) {
+    return (SP_JSX.jsxs(DFL.ModalRoot, { onCancel: closeModal, closeModal: closeModal, children: [SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.heading, fontWeight: 600, marginBottom: "6px" }, children: title }), SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.muted, marginBottom: "8px", overflowWrap: "anywhere" }, children: path || "no log file" }), SP_JSX.jsx("pre", { style: {
+                    margin: 0,
+                    maxHeight: "60vh",
+                    overflowY: "auto",
+                    whiteSpace: "pre-wrap",
+                    overflowWrap: "anywhere",
+                    fontSize: theme.fontSize.small,
+                    lineHeight: "1.4",
+                    color: theme.text.primary,
+                    background: theme.surface.sm,
+                    padding: "8px",
+                    borderRadius: theme.radius.md,
+                }, children: lines.length ? lines.join("\n") : "The log is empty." })] }));
 }
 
 const CHECK_EVENT = "cachyos_updater_check";
 const UPGRADE_EVENT = "cachyos_updater_upgrade";
 const REFRESH_INTERVAL = 4000;
 const REFRESH_INTERVAL_UPGRADING = 2000;
-const PLUGIN_UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1000;
-const PLUGIN_UPDATE_DEDUPE_MS = 60 * 1000;
+const CHECK_TIMEOUT_MS = 6 * 60 * 1000;
+const ACTION_TIMEOUT_MS = 60 * 1000;
+const STATUS_FAILURES_BEFORE_BANNER = 3;
+const PLUGIN_UPDATE_CACHE_MS = 30 * 60 * 1000;
 const PLUGIN_UPDATE_TIMEOUT_MS = 60 * 1000;
+const STALE_CHECK_FOR_INSTALL_S = 3600;
+const BATTERY_WARN_PERCENT = 40;
+// Survives the QAM closing (the panel component unmounts every time): one
+// GitHub API request per half hour, and the self-update lock keeps holding
+// while Decky is about to restart us.
+let pluginUpdateCache = { info: null, checkedAt: 0 };
+let pluginUpdatingSince = 0;
+function toastCheck(p) {
+    if (!p || !p.notify)
+        return;
+    const names = p.relevant_names?.length ? p.relevant_names.join(", ") : "";
+    const more = p.relevant_count > (p.relevant_names?.length ?? 0) ? ", …" : "";
+    const body = p.relevant_count > 0
+        ? `${p.updates_count} update${p.updates_count === 1 ? "" : "s"} available - ${names}${more}`
+        : `${p.updates_count} system update${p.updates_count === 1 ? "" : "s"} available`;
+    toaster.toast({
+        title: "CachyOS Updater",
+        body,
+        icon: SP_JSX.jsx(FaDownload, {}),
+        duration: 8000,
+        onClick: () => DFL.Navigation.OpenQuickAccessMenu(DFL.QuickAccessTab.Decky),
+    });
+}
+function toastUpgrade(p) {
+    if (!p)
+        return;
+    const body = p.state === "succeeded"
+        ? p.reboot_required
+            ? "System update finished - reboot required."
+            : p.reboot_recommended
+                ? "System update finished - reboot recommended."
+                : "System update finished."
+        : p.state === "interrupted"
+            ? "System update was interrupted - open the panel for details."
+            : "System update failed - open the panel for details.";
+    toaster.toast({
+        title: "CachyOS Updater",
+        body,
+        icon: SP_JSX.jsx(FaDownload, {}),
+        duration: 10000,
+        critical: p.state !== "succeeded",
+        onClick: () => DFL.Navigation.OpenQuickAccessMenu(DFL.QuickAccessTab.Decky),
+    });
+}
 // Catches render-time exceptions in the panel tree so a bad status shape or
 // other unexpected error surfaces a recoverable message instead of Decky
 // blanking the panel.
@@ -457,47 +621,95 @@ class ErrorBoundary extends SP_REACT.Component {
         return this.props.children;
     }
 }
+const RENDERED_ERROR_KEYS = new Set([
+    "check", "upgrade", "reboot", "boot_wake", "interval", "notify_mode", "custom_patterns", "lock",
+]);
 function Content() {
     const [status, setStatus] = SP_REACT.useState(null);
+    const [statusError, setStatusError] = SP_REACT.useState(null);
     const [errors, setErrors] = SP_REACT.useState({});
+    // isBusy locks the short setter-style actions; checking only the two
+    // buttons that would conflict with a running check (30-60 s).
     const [isBusy, setIsBusy] = SP_REACT.useState(false);
+    const [checking, setChecking] = SP_REACT.useState(false);
     const [checkMessage, setCheckMessage] = SP_REACT.useState(null);
     const [customPatternsInput, setCustomPatternsInput] = SP_REACT.useState("");
-    // Plugin self-update flow state
-    const [pluginUpdateInfo, setPluginUpdateInfo] = SP_REACT.useState(null);
+    const [pluginUpdateInfo, setPluginUpdateInfo] = SP_REACT.useState(pluginUpdateCache.info);
     const [checkingPluginUpdate, setCheckingPluginUpdate] = SP_REACT.useState(false);
-    const [pluginUpdating, setPluginUpdating] = SP_REACT.useState(false);
+    const [pluginUpdating, setPluginUpdating] = SP_REACT.useState(Date.now() - pluginUpdatingSince < PLUGIN_UPDATE_TIMEOUT_MS);
     const [pluginUpdateError, setPluginUpdateError] = SP_REACT.useState(null);
-    // busyRef is the synchronous re-entrancy guard; isBusy is its React mirror.
     const busyRef = SP_REACT.useRef(false);
     const patternsEditingRef = SP_REACT.useRef(false);
-    const lastPluginCheckAtRef = SP_REACT.useRef(0);
+    const pollSeqRef = SP_REACT.useRef(0);
+    const failedPollsRef = SP_REACT.useRef(0);
+    const lastCheckAtRef = SP_REACT.useRef(null);
     const setBusy = SP_REACT.useCallback((val) => {
         busyRef.current = val;
         setIsBusy(val);
     }, []);
+    const clearError = SP_REACT.useCallback((key) => {
+        setErrors((prev) => {
+            if (!(key in prev))
+                return prev;
+            const next = { ...prev };
+            delete next[key];
+            return next;
+        });
+    }, []);
     const refreshStatus = SP_REACT.useCallback(async (force = false) => {
         if (!force && busyRef.current)
             return;
+        // Sequence number: a response that started before a newer request (or
+        // before an optimistic update) is dropped instead of reverting the UI.
+        const seq = ++pollSeqRef.current;
         try {
             const s = await getStatus();
-            if (!s || !s.success)
+            if (seq !== pollSeqRef.current)
                 return;
+            if (!s || !s.success) {
+                failedPollsRef.current++;
+                if (failedPollsRef.current >= STATUS_FAILURES_BEFORE_BANNER) {
+                    setStatusError(s?.message ?? "The plugin backend returned an error.");
+                }
+                return;
+            }
+            failedPollsRef.current = 0;
+            setStatusError(null);
+            if (lastCheckAtRef.current !== null && s.check.last_check_at !== lastCheckAtRef.current) {
+                // A newer check result arrived (manual, scheduled or after an
+                // upgrade): stale frontend-side check messages must not contradict it.
+                clearError("check");
+                setCheckMessage(null);
+            }
+            lastCheckAtRef.current = s.check.last_check_at;
             setStatus(s);
             if (!patternsEditingRef.current) {
                 setCustomPatternsInput(s.settings?.custom_patterns ?? "");
             }
         }
         catch (e) {
+            failedPollsRef.current++;
+            if (failedPollsRef.current >= STATUS_FAILURES_BEFORE_BANNER) {
+                setStatusError("Couldn't reach the plugin backend.");
+            }
             console.error("CachyOS Updater: failed to get status", e);
         }
-    }, []);
-    const runPluginUpdateCheck = SP_REACT.useCallback((force = false) => {
+    }, [clearError]);
+    const runPluginUpdateCheck = SP_REACT.useCallback(async (force = false) => {
         const now = Date.now();
-        if (!force && now - lastPluginCheckAtRef.current < PLUGIN_UPDATE_DEDUPE_MS)
+        if (!force && now - pluginUpdateCache.checkedAt < PLUGIN_UPDATE_CACHE_MS) {
+            setPluginUpdateInfo(pluginUpdateCache.info);
             return;
-        lastPluginCheckAtRef.current = now;
-        checkForPluginUpdate().then(setPluginUpdateInfo).catch(() => { });
+        }
+        pluginUpdateCache.checkedAt = now;
+        try {
+            const info = await checkForPluginUpdate();
+            pluginUpdateCache = { info, checkedAt: Date.now() };
+            setPluginUpdateInfo(info);
+        }
+        catch {
+            // offline or backend not ready; the button stays available
+        }
     }, []);
     // Status poll, paused while the panel is hidden; faster while pacman runs.
     const upgradeRunning = status?.upgrade?.state === "running";
@@ -507,8 +719,8 @@ function Content() {
         const start = () => {
             if (id)
                 return;
-            refreshStatus();
-            id = setInterval(refreshStatus, interval);
+            void refreshStatus();
+            id = setInterval(() => void refreshStatus(), interval);
         };
         const stop = () => {
             if (id) {
@@ -525,55 +737,45 @@ function Content() {
             stop();
         };
     }, [refreshStatus, upgradeRunning]);
-    // Backend events refresh the panel immediately (the global toast handler
-    // lives in definePlugin so it works with the panel closed).
+    // Backend events refresh the panel immediately (toasts are handled in
+    // definePlugin so they work with the panel closed).
     SP_REACT.useEffect(() => {
-        const onCheck = () => {
+        const onEvent = () => {
             void refreshStatus(true);
         };
-        const onUpgrade = () => {
-            void refreshStatus(true);
-        };
-        addEventListener(CHECK_EVENT, onCheck);
-        addEventListener(UPGRADE_EVENT, onUpgrade);
+        addEventListener(CHECK_EVENT, onEvent);
+        addEventListener(UPGRADE_EVENT, onEvent);
         return () => {
-            removeEventListener(CHECK_EVENT, onCheck);
-            removeEventListener(UPGRADE_EVENT, onUpgrade);
+            removeEventListener(CHECK_EVENT, onEvent);
+            removeEventListener(UPGRADE_EVENT, onEvent);
         };
     }, [refreshStatus]);
-    // Plugin self-update: check on mount and periodically while open.
     SP_REACT.useEffect(() => {
-        runPluginUpdateCheck();
-        const id = setInterval(() => {
-            if (!document.hidden)
-                runPluginUpdateCheck();
-        }, PLUGIN_UPDATE_CHECK_INTERVAL);
-        return () => clearInterval(id);
+        void runPluginUpdateCheck();
     }, [runPluginUpdateCheck]);
     // Safety timeout for the plugin self-update: if plugin_loader hasn't
-    // restarted us within 60s, the detached script probably failed.
+    // restarted us within 60 s, the detached script probably failed (it never
+    // restarts Decky on a failed copy, so the old version keeps running).
     SP_REACT.useEffect(() => {
         if (!pluginUpdating)
             return;
+        const remaining = Math.max(1000, PLUGIN_UPDATE_TIMEOUT_MS - (Date.now() - pluginUpdatingSince));
         const id = setTimeout(() => {
+            pluginUpdatingSince = 0;
             setPluginUpdating(false);
             setBusy(false);
-            setPluginUpdateError("Plugin update didn't complete. Try again, or reinstall with install.sh.");
-        }, PLUGIN_UPDATE_TIMEOUT_MS);
+            setPluginUpdateError("Plugin update didn't complete; the installed version is unchanged. Try again or reinstall with install.sh.");
+        }, remaining);
         return () => clearTimeout(id);
     }, [pluginUpdating, setBusy]);
     // ---- handlers ----
-    const runAction = async (key, fn) => {
+    const runAction = async (key, fn, what = "The action") => {
         if (busyRef.current)
             return;
         setBusy(true);
-        setErrors((prev) => {
-            const next = { ...prev };
-            delete next[key];
-            return next;
-        });
+        clearError(key);
         try {
-            const result = await fn();
+            const result = await withTimeout(fn(), ACTION_TIMEOUT_MS, what);
             if (result && !result.success) {
                 const detail = result.detail ? ` (${result.detail})` : "";
                 setErrors((prev) => ({ ...prev, [key]: (result.message ?? "Something went wrong") + detail }));
@@ -581,7 +783,7 @@ function Content() {
         }
         catch (e) {
             console.error(`CachyOS Updater: ${key} failed`, e);
-            setErrors((prev) => ({ ...prev, [key]: "Backend call failed - check the Decky log." }));
+            setErrors((prev) => ({ ...prev, [key]: `${what} failed - see ${DECKY_LOG_DIR}` }));
         }
         finally {
             await refreshStatus(true);
@@ -589,75 +791,125 @@ function Content() {
         }
     };
     const handleCheckNow = async () => {
-        if (busyRef.current)
+        if (checking || busyRef.current)
             return;
+        setChecking(true);
         setCheckMessage(null);
-        setBusy(true);
-        setErrors((prev) => {
-            const next = { ...prev };
-            delete next.check;
-            return next;
-        });
-        // Show "Checking..." immediately - the backend flag only flips once the
-        // call has reached it.
+        clearError("check");
+        // Optimistic "Checking..." and invalidate in-flight polls so an older
+        // response can't revert it; the backend flag takes over on the next poll.
+        pollSeqRef.current++;
         setStatus((prev) => (prev ? { ...prev, check: { ...prev.check, in_progress: true } } : prev));
+        let frontendError = null;
+        let skippedMessage = null;
         try {
-            const result = await checkForUpdates();
+            const result = await withTimeout(checkForUpdates(), CHECK_TIMEOUT_MS, "The update check");
             if (!result.success) {
-                const detail = result.detail ? ` (${result.detail})` : "";
-                setErrors((prev) => ({ ...prev, check: (result.message ?? "Update check failed") + detail }));
+                // Persisted failures (mirror/lock) come back through status;
+                // the ones the backend does not record are shown from here.
+                if (result.error === "offline" || result.error === "pacman_locked" || result.error === "no_pacman" || result.error === "upgrade_running") {
+                    frontendError = result.message ?? "Update check failed.";
+                }
             }
             else if (result.skipped) {
-                setCheckMessage(result.message ?? "Check skipped.");
-            }
-            else if ((result.updates_count ?? 0) === 0) {
-                setCheckMessage("System is up to date.");
+                skippedMessage = result.message ?? "Check skipped.";
             }
         }
         catch (e) {
             console.error("CachyOS Updater: check failed", e);
-            setErrors((prev) => ({ ...prev, check: "Backend call failed - check the Decky log." }));
+            frontendError = `The update check did not finish in time - see ${DECKY_LOG_DIR}`;
+        }
+        finally {
+            await refreshStatus(true);
+            if (frontendError)
+                setErrors((prev) => ({ ...prev, check: frontendError }));
+            if (skippedMessage)
+                setCheckMessage(skippedMessage);
+            setChecking(false);
+        }
+    };
+    const startUpgrade$1 = () => runAction("upgrade", () => startUpgrade(), "Starting the update");
+    const confirmUpgrade = () => {
+        if (busyRef.current || !status)
+            return;
+        const check = status.check;
+        const updates = check.updates;
+        const relevant = updates.filter((u) => u.relevant);
+        const size = formatBytes(check.total_download_size);
+        const hasKernel = updates.some((u) => u.category === "kernel");
+        const stale = check.last_check_at > 0 && Math.floor(Date.now() / 1000) - check.last_check_at > STALE_CHECK_FOR_INSTALL_S;
+        const power = status.power;
+        const batteryWarn = power.battery_percent !== null && power.battery_percent < BATTERY_WARN_PERCENT && !power.on_ac;
+        const shownRelevant = relevant.slice(0, 6);
+        const running = DFL.Router.MainRunningApp?.display_name;
+        DFL.showModal(SP_JSX.jsx(DFL.ConfirmModal, { strTitle: "Install system updates", strOKButtonText: "Install", onOK: () => {
+                void startUpgrade$1();
+            }, strDescription: SP_JSX.jsxs("div", { style: { display: "flex", flexDirection: "column", gap: "8px" }, children: [SP_JSX.jsxs("div", { children: ["pacman -Syu will install ", updates.length, " package update", updates.length === 1 ? "" : "s", size ? ` (${size} download)` : "", "."] }), shownRelevant.length > 0 && (SP_JSX.jsxs("div", { children: ["Gaming-relevant:", " ", shownRelevant.map((u) => `${u.name} ${u.new_version}`).join(", "), relevant.length > shownRelevant.length ? ` and ${relevant.length - shownRelevant.length} more` : "", "."] })), SP_JSX.jsx("div", { children: hasKernel
+                            ? "This includes a kernel update - a reboot will be required afterwards."
+                            : "Kernel or graphics updates need a reboot afterwards." }), running && SP_JSX.jsxs("div", { children: [running, " is running and may misbehave while its files are replaced - quit it first."] }), batteryWarn && (SP_JSX.jsxs("div", { style: { color: theme.warning.text }, children: ["Battery at ", power.battery_percent, "% and not charging - plug in first (below 25% the update is refused)."] })), stale && (SP_JSX.jsxs("div", { style: { color: theme.text.secondary }, children: ["Based on a check ", timeAgo(check.last_check_at), "; pacman re-syncs and may install a slightly different set."] })), SP_JSX.jsx("div", { style: { color: theme.text.secondary }, children: "The update keeps running even if you close this menu or Steam; sleep is blocked until it finishes." })] }) }));
+    };
+    const confirmReboot = () => {
+        if (busyRef.current)
+            return;
+        const running = DFL.Router.MainRunningApp?.display_name;
+        DFL.showModal(SP_JSX.jsx(DFL.ConfirmModal, { strTitle: "Reboot now?", strDescription: running
+                ? `${running} is still running and will be closed. The device restarts immediately.`
+                : "The device restarts immediately.", strOKButtonText: "Reboot", onOK: () => {
+                void runAction("reboot", () => rebootSystem(), "Reboot");
+            } }));
+    };
+    const handleShowLog = async () => {
+        try {
+            const r = await withTimeout(getUpgradeLog(80), ACTION_TIMEOUT_MS, "Loading the log");
+            DFL.showModal(SP_JSX.jsx(LogModal, { title: "Upgrade log (last 80 lines)", path: r.path ?? "", lines: r.lines ?? [] }));
+        }
+        catch (e) {
+            console.error("CachyOS Updater: log fetch failed", e);
+            setErrors((prev) => ({ ...prev, upgrade: `Couldn't load the log - see ${DECKY_LOG_DIR}` }));
+        }
+    };
+    const handleDismissResult = () => runAction("dismiss", () => dismissUpgradeResult(), "Dismiss");
+    const handleClearStaleLock = () => runAction("lock", () => clearStaleLock(), "Removing the lock");
+    const handleToggleBootWake = (val) => runAction("boot_wake", () => setCheckOnBootWake(val), "Saving");
+    const handleIntervalChange = (hours) => runAction("interval", () => setCheckInterval(hours), "Saving");
+    const handleNotifyModeChange = (mode) => runAction("notify_mode", () => setNotifyMode(mode), "Saving");
+    const handleFilterChange = (mode) => runAction("list_filter", () => setListFilter(mode), "Saving");
+    const savedPatterns = status?.settings.custom_patterns ?? "";
+    const customPatternsDirty = customPatternsInput.trim() !== savedPatterns;
+    const handleSaveCustomPatterns = async () => {
+        if (!customPatternsDirty) {
+            patternsEditingRef.current = false;
+            return;
+        }
+        if (busyRef.current)
+            return;
+        setBusy(true);
+        clearError("custom_patterns");
+        try {
+            const result = await withTimeout(setCustomPatterns(customPatternsInput), ACTION_TIMEOUT_MS, "Saving");
+            if (result.success) {
+                // Only a successful save hands the field back to the status poll;
+                // a rejected value stays visible next to its error.
+                patternsEditingRef.current = false;
+            }
+            else {
+                setErrors((prev) => ({ ...prev, custom_patterns: result.message ?? "Couldn't save the patterns." }));
+            }
+        }
+        catch {
+            setErrors((prev) => ({ ...prev, custom_patterns: `Saving failed - see ${DECKY_LOG_DIR}` }));
         }
         finally {
             await refreshStatus(true);
             setBusy(false);
         }
     };
-    const startUpgrade$1 = () => runAction("upgrade", () => startUpgrade());
-    const confirmUpgrade = () => {
-        if (busyRef.current || !status)
-            return;
-        const count = status.check.updates.length;
-        const size = formatBytes(status.check.total_download_size);
-        DFL.showModal(SP_JSX.jsx(DFL.ConfirmModal, { strTitle: "Install system updates", strDescription: `pacman -Syu will install ${count} package update${count === 1 ? "" : "s"}` +
-                (size ? ` (${size} download)` : "") +
-                ". Running games may be affected; kernel or graphics updates need a reboot afterwards. " +
-                "The update keeps running even if you close this menu or Steam.", strOKButtonText: "Install", onOK: () => {
-                void startUpgrade$1();
-            } }));
-    };
-    const confirmReboot = () => {
-        if (busyRef.current)
-            return;
-        DFL.showModal(SP_JSX.jsx(DFL.ConfirmModal, { strTitle: "Reboot now?", strDescription: "The device restarts immediately. Make sure no game is running.", strOKButtonText: "Reboot", onOK: () => {
-                void runAction("reboot", () => rebootSystem());
-            } }));
-    };
-    const handleDismissResult = () => runAction("dismiss", () => dismissUpgradeResult());
-    const handleToggleBootWake = (val) => runAction("boot_wake", () => setCheckOnBootWake(val));
-    const handleIntervalChange = (hours) => runAction("interval", () => setCheckInterval(hours));
-    const handleToggleGamingOnly = (val) => runAction("gaming_only", () => setGamingOnlyNotify(val));
-    const handleFilterChange = (mode) => runAction("list_filter", () => setListFilter(mode));
-    const handleSaveCustomPatterns = () => {
-        if ((status?.settings.custom_patterns ?? "") === customPatternsInput.trim())
-            return;
-        void runAction("custom_patterns", () => setCustomPatterns(customPatternsInput));
-    };
     const confirmReset = () => {
         if (busyRef.current)
             return;
         DFL.showModal(SP_JSX.jsx(DFL.ConfirmModal, { strTitle: "Reset settings", strDescription: "Restores the default check schedule and notification mode. Pending updates are not affected.", strOKButtonText: "Reset", onOK: () => {
-                void runAction("reset", () => resetSettings());
+                patternsEditingRef.current = false;
+                void runAction("reset", () => resetSettings(), "Reset");
             } }));
     };
     const handleApplyPluginUpdate = async () => {
@@ -665,10 +917,12 @@ function Content() {
             return;
         setBusy(true);
         setPluginUpdateError(null);
+        pluginUpdatingSince = Date.now();
         setPluginUpdating(true);
         try {
             const res = await applyPluginUpdate();
             if (res && res.success === false) {
+                pluginUpdatingSince = 0;
                 setPluginUpdating(false);
                 setBusy(false);
                 setPluginUpdateError(res.message ?? "Plugin update failed to start.");
@@ -682,32 +936,42 @@ function Content() {
     const handleCheckForPluginUpdate = async () => {
         setCheckingPluginUpdate(true);
         setPluginUpdateError(null);
-        lastPluginCheckAtRef.current = Date.now();
-        try {
-            setPluginUpdateInfo(await checkForPluginUpdate());
-        }
-        catch {
-            // ignore
-        }
+        await runPluginUpdateCheck(true);
         setCheckingPluginUpdate(false);
     };
     // ---- render ----
     if (!status) {
-        return SP_JSX.jsx(DFL.PanelSection, { title: "CachyOS Updater" });
+        if (statusError) {
+            return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsxs(Banner, { variant: "error", icon: "\u2715", children: ["Couldn't reach the plugin backend: ", statusError, ". Check ", DECKY_LOG_DIR] }), SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: () => {
+                                    failedPollsRef.current = 0;
+                                    setStatusError(null);
+                                    void refreshStatus(true);
+                                }, children: "Retry" }) }) })] }));
+        }
+        return SP_JSX.jsx(DFL.PanelSection, { title: "System updates", spinner: true });
     }
     const s = status.settings;
     const check = status.check;
     const upgrade = status.upgrade;
     const updates = check.updates;
     const relevant = check.relevant_count;
-    const gamingOnly = s.gaming_only_notify;
+    const notifyMode = s.notify_mode;
     const running = upgrade.state === "running";
-    const showResult = !running && upgrade.state !== "idle" && !upgrade.acknowledged;
-    const rebootNeeded = status.reboot_required || (showResult && upgrade.reboot_recommended);
+    const checkBusy = checking || check.in_progress;
+    // Right after a successful upgrade the pending list is obsolete until the
+    // post-upgrade check has replaced it (the backend clears it too; this
+    // covers the window in between).
+    const listStale = upgrade.state === "succeeded" && upgrade.finished_at > 0 && check.last_check_at < upgrade.finished_at && updates.length > 0;
+    const lockBlocked = status.pacman_locked;
+    const cannotInstall = !!check.resolve_error;
+    const installDisabled = isBusy || checkBusy || lockBlocked || !status.pacman_available || !status.network_online || status.power.low_battery || cannotInstall || listStale;
     let statusLine;
     let statusColor = theme.text.secondary;
-    if (check.in_progress) {
-        statusLine = "Checking for updates...";
+    if (checkBusy) {
+        statusLine = "Checking for updates... this can take a minute.";
+    }
+    else if (listStale) {
+        statusLine = "Update finished - refreshing the pending list...";
     }
     else if (!check.last_check_at) {
         statusLine = "Not checked yet.";
@@ -720,7 +984,7 @@ function Content() {
         statusLine = `System is up to date (checked ${timeAgo(check.last_check_at)}).`;
         statusColor = theme.success.text;
     }
-    else if (gamingOnly && relevant === 0) {
+    else if (notifyMode === "gaming" && relevant === 0) {
         statusLine = `${updates.length} update${updates.length === 1 ? "" : "s"} pending, none gaming-relevant.`;
     }
     else {
@@ -729,65 +993,51 @@ function Content() {
             `${updates.length} update${updates.length === 1 ? "" : "s"} available` +
                 (relevant > 0 ? ` · ${relevant} gaming-relevant` : "") +
                 (size ? ` · ${size}` : "");
-        statusColor = relevant > 0 || !gamingOnly ? theme.info.text : theme.text.secondary;
+        statusColor = theme.info.text;
     }
-    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(PanelHeader, { distroName: status.distro_name, kernel: status.kernel_running, version: status.version ?? "?", lastCheckAt: check.last_check_at, trigger: check.trigger }), !status.pacman_available && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: "pacman was not found. This plugin only works on CachyOS / Arch-based systems." })), pluginUpdateInfo?.update_available && !pluginUpdating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: handleApplyPluginUpdate, children: ["Update plugin to v", pluginUpdateInfo.latest_version] }) }) })), showResult && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(Banner, { variant: upgrade.state === "succeeded" ? (upgrade.reboot_recommended ? "warning" : "success") : "error", icon: upgrade.state === "succeeded" ? "✓" : "✕", children: upgrade.state === "succeeded"
-                            ? `Update finished: ${upgrade.message}` +
-                                (upgrade.pacnew ? ` ${upgrade.pacnew} .pacnew file${upgrade.pacnew === 1 ? "" : "s"} to review.` : "") +
-                                (upgrade.reboot_required
-                                    ? " The running kernel was replaced - reboot required."
-                                    : upgrade.reboot_recommended
-                                        ? " Kernel, graphics or Steam components changed - reboot recommended."
-                                        : "")
-                            : upgrade.state === "interrupted"
-                                ? upgrade.message
-                                : `Update failed: ${upgrade.message} Run "sudo pacman -Syu" from Desktop Mode or a TTY to resolve it.` }), SP_JSX.jsxs(DFL.PanelSection, { children: [rebootNeeded && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: confirmReboot, children: "Reboot now" }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: handleDismissResult, children: "Dismiss" }) })] })] })), !showResult && status.reboot_required && !running && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "The running kernel was replaced by an update - reboot to load the new kernel." }), SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: confirmReboot, children: "Reboot now" }) }) })] })), status.pacman_locked && !running && (SP_JSX.jsx(Banner, { variant: "info", icon: "\u2139", children: "Another package manager holds the pacman lock. Checks and updates wait until it finishes." })), errors.check && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: errors.check })), !errors.check && !check.ok && check.error && !check.in_progress && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: check.error })), errors.upgrade && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: errors.upgrade })), errors.reboot && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: errors.reboot })), running ? (SP_JSX.jsx(UpgradeProgress, { upgrade: upgrade })) : (SP_JSX.jsxs(DFL.PanelSection, { title: "System updates", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: statusColor }, children: statusLine }) }), checkMessage && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.small, color: theme.text.subtitle }, children: checkMessage }) })), updates.length > 0 && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs(DFL.ButtonItem, { layout: "below", disabled: isBusy || check.in_progress || status.pacman_locked || !status.pacman_available, onClick: confirmUpgrade, children: ["Install ", updates.length, " update", updates.length === 1 ? "" : "s"] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || check.in_progress || !status.pacman_available, onClick: handleCheckNow, children: check.in_progress ? "Checking..." : "Check now" }) })] })), !running && updates.length > 0 && (SP_JSX.jsx(UpdateList, { updates: updates, filter: s.list_filter, onFilterChange: handleFilterChange })), SP_JSX.jsx(SettingsSection, { settings: s, intervalChoices: status.interval_choices, gamingGroups: status.gaming_groups, isBusy: isBusy, errors: errors, customPatternsInput: customPatternsInput, onCustomPatternsInput: (value, editing) => {
-                    patternsEditingRef.current = editing;
+    const otherErrors = Object.entries(errors).filter(([k]) => !RENDERED_ERROR_KEYS.has(k));
+    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(PanelHeader, { distroName: status.distro_name, kernel: status.kernel_running, lastCheckAt: check.last_check_at, trigger: check.trigger, intervalHours: s.check_interval_hours, checking: checkBusy }), statusError && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: ["Status updates are failing: ", statusError] })), !status.pacman_available && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: "pacman was not found. This plugin only works on CachyOS / Arch-based systems." })), pluginUpdateInfo?.update_available && !pluginUpdating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs(DFL.ButtonItem, { layout: "below", disabled: isBusy || running, onClick: handleApplyPluginUpdate, children: ["Update plugin to v", pluginUpdateInfo.latest_version] }) }) })), !running && (SP_JSX.jsx(UpgradeResult, { upgrade: upgrade, bootTime: status.boot_time, isBusy: isBusy, onDismiss: handleDismissResult, onReboot: confirmReboot, onRetry: confirmUpgrade, onShowLog: () => void handleShowLog() })), !running &&
+                status.reboot_required &&
+                !(upgrade.finished_at > status.boot_time && (upgrade.reboot_required || upgrade.reboot_recommended)) && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "The running kernel was replaced by an update - reboot to load the new kernel." }), SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: confirmReboot, children: "Reboot now" }) }) })] })), lockBlocked && !running && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(Banner, { variant: status.pacman_lock_stale ? "warning" : "info", icon: status.pacman_lock_stale ? "⚠" : "ℹ", children: status.pacman_lock_stale
+                            ? "A stale pacman lock (/var/lib/pacman/db.lck) is blocking checks and updates. No package manager is running, so it was left behind by an interrupted transaction."
+                            : "Another package manager holds the pacman lock; checks and updates are paused until it finishes." }), status.pacman_lock_stale && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: handleClearStaleLock, children: "Remove stale lock" }) }) }))] })), errors.lock && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: errors.lock })), !status.network_online && (SP_JSX.jsx(Banner, { variant: "info", icon: "\u2139", children: "No network connection. Checks resume automatically once WiFi is back." })), errors.check && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: errors.check })), !errors.check && !check.ok && check.error && !checkBusy && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: [check.error, check.detail ? ` (${check.detail})` : "", check.kind === "network" ? " Check the WiFi connection and try again." : ""] })), cannotInstall && !running && !listStale && (SP_JSX.jsxs(Banner, { variant: "error", icon: "\u2715", children: ["These updates can't be installed automatically: ", check.resolve_error, " Run \"sudo pacman -Syu\" once from Desktop Mode or a TTY (Ctrl+Alt+F3)."] })), errors.upgrade && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: errors.upgrade })), errors.reboot && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: errors.reboot })), otherErrors.map(([key, message]) => (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: message }, key))), running ? (SP_JSX.jsx(UpgradeProgress, { upgrade: upgrade })) : (SP_JSX.jsxs(DFL.PanelSection, { title: "System updates", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: statusColor, overflowWrap: "anywhere" }, children: statusLine }) }), checkMessage && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.small, color: theme.text.subtitle }, children: checkMessage }) })), status.power.low_battery && updates.length > 0 && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.small, color: theme.warning.text }, children: ["Battery at ", status.power.battery_percent, "% and not charging - plug in to install."] }) })), updates.length > 0 && !listStale && !cannotInstall && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs(DFL.ButtonItem, { layout: "below", disabled: installDisabled, onClick: confirmUpgrade, children: ["Install ", updates.length, " update", updates.length === 1 ? "" : "s", check.total_download_size ? ` · ${formatBytes(check.total_download_size)}` : ""] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: checkBusy || isBusy || lockBlocked || !status.pacman_available, onClick: handleCheckNow, children: checkBusy ? "Checking..." : "Check now" }) })] })), !running && !listStale && updates.length > 0 && (SP_JSX.jsx(UpdateList, { updates: updates, filter: s.list_filter, onFilterChange: handleFilterChange })), SP_JSX.jsx(SettingsSection, { settings: s, intervalChoices: status.interval_choices, gamingGroups: status.gaming_groups, lastCheckAt: check.last_check_at, isBusy: isBusy, errors: errors, customPatternsInput: customPatternsInput, customPatternsDirty: customPatternsDirty, onCustomPatternsInput: (value) => {
+                    patternsEditingRef.current = true;
                     setCustomPatternsInput(value);
-                }, onToggleBootWake: handleToggleBootWake, onIntervalChange: handleIntervalChange, onToggleGamingOnly: handleToggleGamingOnly, onSaveCustomPatterns: handleSaveCustomPatterns, onReset: confirmReset }), SP_JSX.jsx(PluginUpdatesSection, { updating: pluginUpdating, checking: checkingPluginUpdate, info: pluginUpdateInfo, error: pluginUpdateError, onApply: handleApplyPluginUpdate, onCheck: handleCheckForPluginUpdate }), SP_JSX.jsx(PanelFooter, { version: status.version ?? "?" })] }));
+                }, onToggleBootWake: handleToggleBootWake, onIntervalChange: handleIntervalChange, onNotifyModeChange: handleNotifyModeChange, onSaveCustomPatterns: () => void handleSaveCustomPatterns(), onReset: confirmReset }), SP_JSX.jsx(PluginUpdatesSection, { updating: pluginUpdating, checking: checkingPluginUpdate, info: pluginUpdateInfo, error: pluginUpdateError, disabled: isBusy || running, onApply: handleApplyPluginUpdate, onCheck: handleCheckForPluginUpdate }), SP_JSX.jsx(PanelFooter, { version: status.version ?? "?" })] }));
 }
 var index = definePlugin(() => {
     // Toasts must work with the QAM closed, so the listeners live here rather
     // than in the panel component. The backend decides whether a check result
-    // deserves a toast (new set, gaming-relevant filter, daily reminder).
+    // deserves a toast (new set, notification mode, daily reminder) and parks
+    // it until we acknowledge, in case we were not loaded when it fired.
     const onCheckEvent = (p) => {
-        if (!p || !p.notify)
-            return;
-        const names = p.relevant_names?.length ? p.relevant_names.join(", ") : "";
-        const body = p.relevant_count > 0
-            ? `${p.updates_count} update${p.updates_count === 1 ? "" : "s"} available - ${names}${p.relevant_count > p.relevant_names.length ? ", …" : ""}`
-            : `${p.updates_count} system update${p.updates_count === 1 ? "" : "s"} available`;
-        toaster.toast({
-            title: "CachyOS Updater",
-            body,
-            icon: SP_JSX.jsx(FaDownload, {}),
-            duration: 8000,
-            onClick: () => DFL.Navigation.OpenQuickAccessMenu(),
-        });
+        toastCheck(p);
+        if (p?.notify)
+            pullPendingNotifications().catch(() => { });
     };
     const onUpgradeEvent = (p) => {
-        if (!p)
-            return;
-        const body = p.state === "succeeded"
-            ? p.reboot_required
-                ? "System update finished - reboot required."
-                : p.reboot_recommended
-                    ? "System update finished - reboot recommended."
-                    : "System update finished."
-            : p.state === "interrupted"
-                ? "System update was interrupted - open the panel for details."
-                : "System update failed - open the panel for details.";
-        toaster.toast({
-            title: "CachyOS Updater",
-            body,
-            icon: SP_JSX.jsx(FaDownload, {}),
-            duration: 10000,
-            critical: p.state !== "succeeded",
-            onClick: () => DFL.Navigation.OpenQuickAccessMenu(),
-        });
+        toastUpgrade(p);
+        pullPendingNotifications().catch(() => { });
     };
     addEventListener(CHECK_EVENT, onCheckEvent);
     addEventListener(UPGRADE_EVENT, onUpgradeEvent);
+    // Anything that fired before this frontend existed (boot check, a run
+    // finalized after a reboot).
+    const deliverPending = () => {
+        pullPendingNotifications()
+            .then((r) => {
+            for (const n of (r?.notifications ?? [])) {
+                if (n.kind === "check")
+                    toastCheck(n.payload);
+                else if (n.kind === "upgrade")
+                    toastUpgrade(n.payload);
+            }
+        })
+            .catch(() => { });
+    };
+    // The backend may still be starting when Decky loads the frontends: a
+    // failed pull is retried a couple of times with growing delays.
+    const pendingTimers = [5000, 30000, 120000].map((ms) => setTimeout(deliverPending, ms));
     // Fast path for the wake check: Steam's own resume hook. UNDOCUMENTED and
     // known to disappear in some Steam builds - every failure is swallowed;
     // the backend's clock-based detector covers resume regardless.
@@ -809,6 +1059,7 @@ var index = definePlugin(() => {
         content: (SP_JSX.jsx(ErrorBoundary, { children: SP_JSX.jsx(Content, {}) })),
         icon: SP_JSX.jsx(FaDownload, {}),
         onDismount() {
+            pendingTimers.forEach(clearTimeout);
             removeEventListener(CHECK_EVENT, onCheckEvent);
             removeEventListener(UPGRADE_EVENT, onUpgradeEvent);
             resumeUnsub?.unregister();

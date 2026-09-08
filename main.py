@@ -117,7 +117,7 @@ class Plugin(
     async def _unload(self):
         try:
             decky.logger.info("CachyOS Updater unloading")
-            for name in ("_scheduler_task", "_pending_check_task"):
+            for name in ("_scheduler_task", "_pending_check_task", "_post_upgrade_task"):
                 task = getattr(self, name, None)
                 if task and not task.done():
                     task.cancel()

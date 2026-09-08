@@ -74,10 +74,25 @@ NETWORK_RETRY_DELAY = 120      # boot/wake checks retry on network failure
 NETWORK_RETRIES = 5
 NOTIFY_REMIND_INTERVAL = 24 * 3600   # re-toast an unchanged pending set at most daily
 CHECK_INTERVAL_CHOICES = (0, 1, 3, 6, 12, 24)  # hours; 0 = off
+NOTIFY_MODES = ("all", "gaming", "off")
+NETWORK_WAIT_MAX = 600         # boot/wake: how long to wait for a default route
+NETWORK_POLL = 15              # ... polling this often (cheap /proc read)
+PENDING_TOAST_MAX_AGE = 3 * 24 * 3600  # undelivered toasts older than this are dropped
 
 PACMAN_SYNC_TIMEOUT = 240
 PACMAN_QUERY_TIMEOUT = 90
-UPGRADE_LOG_TAIL_BYTES = 128 * 1024
+UPGRADE_LOG_TAIL_BYTES = 128 * 1024        # progress polling reads the tail only
+UPGRADE_LOG_FINAL_MAX_BYTES = 4 * 1024 * 1024  # finalization reads the whole log (bounded)
+
+# A pacman transaction that dies with the battery is the one thing the sleep
+# inhibitor can't prevent; refuse to start below this unless on AC.
+LOW_BATTERY_PERCENT = 25
+POWER_SUPPLY_DIR = "/sys/class/power_supply"
+PROC_NET_ROUTE = "/proc/net/route"
+PROC_NET_IPV6_ROUTE = "/proc/net/ipv6_route"
+PROC_DIR = "/proc"
+# Processes that legitimately hold pacman's database lock.
+PACKAGE_MANAGER_COMMS = ("pacman", "pamac", "pamac-daemon", "paru", "yay", "pikaur", "pacman-key", "makepkg", "cachy-update")
 
 # ---- Package classification ------------------------------------------------
 
@@ -151,7 +166,7 @@ REBOOT_RECOMMENDED_PATTERNS = [
 DEFAULT_SETTINGS = {
     "check_on_boot_wake": True,
     "check_interval_hours": 6,
-    "gaming_only_notify": False,
+    "notify_mode": "all",           # "all" | "gaming" | "off"
     "custom_patterns": "",
     "list_filter": "all",           # "all" | "gaming" (UI list filter)
     "distro_id": "unknown",
@@ -171,6 +186,7 @@ DEFAULT_UPGRADE_STATE = {
     "reboot_required": False,
     "reboot_recommended": False,
     "message": "",
+    "failure_kind": "",             # network | lock | conflict | keyring | space | unknown | ""
     "acknowledged": True,
 }
 
@@ -179,9 +195,15 @@ DEFAULT_STATE = {
     "last_check_trigger": "",
     "last_check_ok": False,
     "last_check_error": "",
+    "last_check_detail": "",
+    "last_check_kind": "",
+    "resolve_error": "",            # pacman -Sup failed: -Syu would fail the same way
     "updates": [],
     "updates_signature": "",
     "last_notified_signature": "",
     "last_notified_at": 0,
+    # Toasts the frontend has not pulled yet (it may not have been loaded when
+    # the backend emitted the event): one slot per kind.
+    "pending_toasts": {},
     "upgrade": dict(DEFAULT_UPGRADE_STATE),
 }
