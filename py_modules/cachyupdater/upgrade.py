@@ -102,9 +102,9 @@ class UpgradeMixin:
 
     def _launch_upgrade_unit(self) -> dict:
         """Blocking worker: prepare dirs/log, start the transient unit."""
-        state_store.ensure_private_dir(C.STATE_DIR)
-        state_store.ensure_private_dir(C.RUN_DIR)
-        state_store.ensure_private_dir(C.LOG_DIR, 0o755)
+        state_store.ensure_dir(C.STATE_DIR, 0o755)
+        state_store.ensure_dir(C.RUN_DIR, 0o700)
+        state_store.ensure_dir(C.LOG_DIR, 0o755)
         try:
             os.remove(C.UPGRADE_STATUS_FILE)
         except FileNotFoundError:

@@ -1,6 +1,6 @@
 {
   "name": "cachyos-updater",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Decky plugin that checks for and installs CachyOS Handheld Edition system updates from Game Mode",
   "type": "module",
   "scripts": {

@@ -17,7 +17,7 @@ Steam's built-in "System Update" button does nothing on CachyOS (the `steamos-up
 
 ## How the check works
 
-Like `checkupdates` from pacman-contrib: the package databases are synced into a private, root-only copy under `/var/lib/cachyos-updater/db` and diffed against the installed packages with `pacman -Qu`. The system's own sync databases are never touched, so a later `pacman -S foo` from Desktop Mode cannot become an accidental partial upgrade, and no pacman lock is taken. `IgnorePkg` entries are respected.
+Like `checkupdates` from pacman-contrib: the package databases are synced into a private, root-owned copy under `/var/lib/cachyos-updater/db` and diffed against the installed packages with `pacman -Qu`. pacman's download sandbox (`DownloadUser = alpm`) is kept, so the directory is 0755 like `/var/lib/pacman`. The system's own sync databases are never touched, so a later `pacman -S foo` from Desktop Mode cannot become an accidental partial upgrade, and no pacman lock is taken. `IgnorePkg` entries are respected.
 
 ## Install
 
@@ -45,7 +45,7 @@ Upgrade logs are kept in `/var/log/cachyos-updater/` (last 5 runs).
 ## Security notes
 
 - The plugin runs as root (Decky `root` flag) because pacman does. It executes only fixed absolute binaries (`/usr/bin/pacman`, `/usr/bin/systemd-run`, `/usr/bin/systemctl`, `/usr/bin/curl`) with argument lists - no shell interpolation of package names or anything read from the network.
-- State that root produces and consumes (pending list, upgrade bookkeeping, the private DB copy) lives root-only under `/var/lib/cachyos-updater`, not in the user-writable Decky settings directory. Writes into the settings directory are symlink-safe.
+- State that root produces and consumes (pending list, upgrade bookkeeping, the private DB copy) lives root-owned under `/var/lib/cachyos-updater`, not in the user-writable Decky settings directory. Writes into the settings directory are symlink-safe.
 - The upgrade wrapper is fixed script text passed to bash as an argument; paths reach it through the unit's environment.
 - **Signed, verified plugin updates:** releases ship a minisign signature (`SHA256SUMS.minisig`) created by CI. The self-updater verifies it against the public key pinned inside the plugin ([`minisign.pub`](minisign.pub)) before trusting the checksums, then checks the zip against `SHA256SUMS`. To verify manually: `minisign -Vm SHA256SUMS -p minisign.pub`. The installer relies on TLS + repo trust for the first install; signature pinning protects every update after that.
 

@@ -8,7 +8,7 @@ mixins and owns the plugin lifecycle (_main/_unload/_uninstall).
 
 Settings live in settings.json under DECKY_PLUGIN_SETTINGS_DIR; runtime
 state (pending updates, upgrade bookkeeping) and the private pacman DB copy
-live root-only under /var/lib/cachyos-updater. The system upgrade itself runs
+live root-owned under /var/lib/cachyos-updater. The system upgrade itself runs
 as a transient systemd unit so it survives plugin_loader/Steam restarts.
 """
 
@@ -93,11 +93,12 @@ class Plugin(
                 decky.logger.error(f"pacman not found at {C.PACMAN} - this plugin only works on CachyOS/Arch")
 
             # Warm the pacman-conf cache off the event loop and make sure the
-            # root-only directories exist with tight modes.
+            # root-owned directories exist with the right modes (0755 where
+            # pacman's sandboxed download user must traverse, see state.py).
             await asyncio.to_thread(self._pacman_dbpath)
-            for path, mode in ((C.STATE_DIR, 0o700), (C.RUN_DIR, 0o700), (C.LOG_DIR, 0o755)):
+            for path, mode in ((C.STATE_DIR, 0o755), (C.RUN_DIR, 0o700), (C.LOG_DIR, 0o755)):
                 try:
-                    state_store.ensure_private_dir(path, mode)
+                    state_store.ensure_dir(path, mode)
                 except Exception as e:
                     decky.logger.error(f"could not create {path}: {e}")
 

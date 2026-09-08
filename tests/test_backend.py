@@ -382,7 +382,7 @@ def test_state_roundtrip_and_upgrade_merge(env):
     assert "bogus" not in reloaded["upgrade"]
     assert reloaded["upgrade"]["acknowledged"] is True  # default filled in
     mode = oct(os.stat(env["state_dir"]).st_mode & 0o777)
-    assert mode == "0o700"
+    assert mode == "0o755"
 
 
 def test_state_unreadable_falls_back_to_defaults(env):
@@ -412,7 +412,20 @@ def test_prepare_check_db_symlinks_local(plugin, env):
     os.symlink("/nonexistent", link)
     plugin._prepare_check_db()
     assert os.readlink(link) == str(env["pacman_db"] / "local")
-    assert oct(os.stat(db).st_mode & 0o777) == "0o700"
+    # pacman >= 7 downloads as the sandboxed DownloadUser (alpm): every
+    # directory down to dbpath/sync must stay traversable by others, a 0700
+    # dir made every check fail with "Permission denied" (v0.1.0 bug).
+    for path in (C.STATE_DIR, db):
+        assert oct(os.stat(path).st_mode & 0o777) == "0o755", path
+
+
+def test_prepare_check_db_repairs_too_tight_mode(plugin, env):
+    db = plugin._prepare_check_db()
+    os.chmod(C.STATE_DIR, 0o700)
+    os.chmod(db, 0o700)
+    plugin._prepare_check_db()
+    assert oct(os.stat(C.STATE_DIR).st_mode & 0o777) == "0o755"
+    assert oct(os.stat(db).st_mode & 0o777) == "0o755"
 
 
 def test_check_updates_sync_success(plugin, env, monkeypatch):

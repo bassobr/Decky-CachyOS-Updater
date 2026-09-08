@@ -45,9 +45,11 @@ DEFAULT_PACMAN_DBPATH = "/var/lib/pacman"
 
 # ---- Plugin-owned system paths ---------------------------------------------
 
-# Root-only (0700) state: the private copy of the sync databases used for
-# update checks plus state.json. Everything under here is written by root
-# and never lives in a user-writable directory.
+# Root-owned state (0755, like /var/lib/pacman): the private copy of the
+# sync databases used for update checks plus state.json. Everything under
+# here is written by root and never lives in a user-writable directory; it
+# stays world-traversable because pacman >= 7 downloads as the unprivileged
+# DownloadUser into dbpath/sync.
 STATE_DIR = "/var/lib/cachyos-updater"
 CHECK_DB_DIR = STATE_DIR + "/db"
 STATE_FILE = STATE_DIR + "/state.json"

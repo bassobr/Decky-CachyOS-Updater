@@ -1,7 +1,7 @@
 """The update check.
 
 Works like pacman-contrib's `checkupdates`: sync the package databases into a
-private, root-only copy and diff that copy against the installed packages.
+private, root-owned copy and diff that copy against the installed packages.
 The system's own sync databases are never touched, so a later `pacman -S foo`
 from Desktop Mode can never turn into an accidental partial upgrade, and the
 check needs no pacman lock (it also runs fine while another package manager
@@ -38,10 +38,11 @@ class UpdateCheckMixin:
             self._check_in_progress = False
 
     def _prepare_check_db(self) -> str:
-        """Root-only DB directory whose `local` entry is a symlink to the
-        system's local package database (the checkupdates trick)."""
-        state_store.ensure_private_dir(C.STATE_DIR)
-        state_store.ensure_private_dir(C.CHECK_DB_DIR)
+        """Root-owned DB directory whose `local` entry is a symlink to the
+        system's local package database (the checkupdates trick). 0755, not
+        0700: pacman's sandboxed download user has to reach dbpath/sync."""
+        state_store.ensure_dir(C.STATE_DIR, 0o755)
+        state_store.ensure_dir(C.CHECK_DB_DIR, 0o755)
         local_link = os.path.join(C.CHECK_DB_DIR, "local")
         target = os.path.join(self._pacman_dbpath(), "local")
         current = None
@@ -74,7 +75,7 @@ class UpdateCheckMixin:
             return {
                 "success": False,
                 "error": "sync_failed",
-                "message": "Couldn't refresh the package databases (offline, or a mirror problem).",
+                "message": "Couldn't refresh the package databases.",
                 "detail": (r["stderr"] or r["stdout"])[-300:],
             }
         r = self._run_cmd([C.PACMAN, "-Qu", "--dbpath", db], timeout=C.PACMAN_QUERY_TIMEOUT)

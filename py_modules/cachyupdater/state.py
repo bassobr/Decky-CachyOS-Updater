@@ -1,9 +1,10 @@
 """Root-owned runtime state: the last check result and the upgrade run.
 
-Lives under STATE_DIR (0700, root) rather than the user-writable Decky
-settings directory: the update list and the upgrade bookkeeping are produced
-by root and consumed by root, so nothing under the user's home can influence
-them. Same atomic/symlink-safe writer as settings.json.
+Lives under STATE_DIR (root-owned, 0755 like /var/lib/pacman) rather than
+the user-writable Decky settings directory: the update list and the upgrade
+bookkeeping are produced by root and consumed by root, so nothing under the
+user's home can influence them. Same atomic/symlink-safe writer as
+settings.json.
 """
 
 import copy
@@ -21,9 +22,14 @@ STATE_FILE = C.STATE_FILE
 _state_lock = threading.RLock()
 
 
-def ensure_private_dir(path: str, mode: int = 0o700):
-    """Create a root-only directory (no-op if present); tighten the mode of
-    an existing directory so an earlier, looser creation can't persist."""
+def ensure_dir(path: str, mode: int = 0o755):
+    """Create a root-owned directory (no-op if present) and pin its mode.
+
+    Default 0755 like /var/lib/pacman: only root writes here, but the
+    directories must stay traversable by others - pacman >= 7 downloads as
+    the unprivileged DownloadUser (alpm) into a temp dir below dbpath/sync,
+    and a 0700 parent makes every sync fail with "Permission denied".
+    Pass 0o700 for directories nothing but root ever needs (RUN_DIR)."""
     os.makedirs(path, mode=mode, exist_ok=True)
     try:
         os.chmod(path, mode)
@@ -55,7 +61,7 @@ def load_state() -> dict:
 
 def save_state(data: dict):
     with _state_lock:
-        ensure_private_dir(os.path.dirname(STATE_FILE))
+        ensure_dir(os.path.dirname(STATE_FILE))
         write_json_atomic(STATE_FILE, data)
 
 
