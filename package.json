@@ -14,7 +14,7 @@
     "@decky/ui": "^4.12.0",
     "@rollup/rollup-linux-x64-musl": "^4.63.1",
     "@types/react": "19.2.18",
-    "@types/react-dom": "19.2.5",
+    "@types/react-dom": "19.2.7",
     "rollup": "^4.63.1",
     "typescript": "^7.0.2"
   },
