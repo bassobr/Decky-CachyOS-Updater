@@ -1,0 +1,79 @@
+"""Root-owned runtime state: the last check result and the upgrade run.
+
+Lives under STATE_DIR (0700, root) rather than the user-writable Decky
+settings directory: the update list and the upgrade bookkeeping are produced
+by root and consumed by root, so nothing under the user's home can influence
+them. Same atomic/symlink-safe writer as settings.json.
+"""
+
+import copy
+import json
+import os
+import threading
+
+from . import constants as C
+from .deckyshim import decky
+from .settings import write_json_atomic
+
+# Tests point this at a temp file.
+STATE_FILE = C.STATE_FILE
+
+_state_lock = threading.RLock()
+
+
+def ensure_private_dir(path: str, mode: int = 0o700):
+    """Create a root-only directory (no-op if present); tighten the mode of
+    an existing directory so an earlier, looser creation can't persist."""
+    os.makedirs(path, mode=mode, exist_ok=True)
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def default_state() -> dict:
+    return copy.deepcopy(C.DEFAULT_STATE)
+
+
+def load_state() -> dict:
+    with _state_lock:
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("state root is not a JSON object")
+        except FileNotFoundError:
+            return default_state()
+        except Exception as e:
+            decky.logger.error(f"state.json unreadable ({e}); starting from defaults")
+            return default_state()
+        merged = {**default_state(), **data}
+        upgrade = {**copy.deepcopy(C.DEFAULT_UPGRADE_STATE), **(data.get("upgrade") or {})}
+        merged["upgrade"] = {k: v for k, v in upgrade.items() if k in C.DEFAULT_UPGRADE_STATE}
+        return {k: v for k, v in merged.items() if k in C.DEFAULT_STATE}
+
+
+def save_state(data: dict):
+    with _state_lock:
+        ensure_private_dir(os.path.dirname(STATE_FILE))
+        write_json_atomic(STATE_FILE, data)
+
+
+def update_state_fields(**fields) -> dict:
+    """Atomic load-set-save of top-level state fields."""
+    with _state_lock:
+        state = load_state()
+        state.update(fields)
+        save_state(state)
+        return state
+
+
+def update_upgrade_state(**fields) -> dict:
+    """Atomic load-set-save of fields inside state["upgrade"]."""
+    with _state_lock:
+        state = load_state()
+        upgrade = dict(state.get("upgrade") or {})
+        upgrade.update(fields)
+        state["upgrade"] = upgrade
+        save_state(state)
+        return state

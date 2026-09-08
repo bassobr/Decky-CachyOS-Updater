@@ -1,0 +1,6 @@
+node_modules/
+out/
+.vscode/settings.json
+*.pyc
+__pycache__/
+.pytest_cache/

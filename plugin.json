@@ -1,0 +1,11 @@
+{
+  "name": "CachyOS Updater",
+  "author": "bassobr",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["cachyos", "update", "pacman", "system", "handheld", "gaming"],
+    "description": "Check for and install CachyOS Handheld Edition system updates from Game Mode - no Desktop Mode needed.",
+    "image": ""
+  }
+}
