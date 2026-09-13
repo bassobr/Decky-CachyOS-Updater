@@ -395,11 +395,41 @@ function UpdateList({ updates, filter, onFilterChange }) {
                                     }, children: u.name }), u.relevant && u.category && SP_JSX.jsx(StatusBadge, { text: CATEGORY_LABELS[u.category] ?? u.category })] }), SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.muted, overflowWrap: "anywhere" }, children: [u.old_version, " \u2192 ", u.new_version, u.download_size ? ` · ${formatBytes(u.download_size)}` : "", u.repo ? ` · ${u.repo}` : ""] })] }) }, u.name))), hidden > 0 && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs(DFL.ButtonItem, { layout: "below", onClick: () => setVisibleCount(visibleCount + PAGE_SIZE), children: ["Show ", Math.min(PAGE_SIZE, hidden), " more (", hidden, " hidden)"] }) })), hidden === 0 && shown.length > INITIAL_COUNT && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: () => setVisibleCount(INITIAL_COUNT), children: "Show fewer" }) }))] }));
 }
 
+// Bar drawn with plain divs. Used when Steam's ProgressBar module can't be
+// located (findModuleExport returns undefined after a Steam client update).
+function FallbackBar({ percent, indeterminate }) {
+    return (SP_JSX.jsxs("div", { style: {
+            position: "relative",
+            width: "100%",
+            height: "6px",
+            borderRadius: "3px",
+            overflow: "hidden",
+            background: theme.surface.lg,
+        }, children: [SP_JSX.jsx("style", { children: `@keyframes cu-indeterminate{0%{left:-40%}100%{left:100%}}` }), SP_JSX.jsx("div", { style: {
+                    position: "absolute",
+                    top: 0,
+                    bottom: 0,
+                    left: 0,
+                    width: indeterminate ? "40%" : `${Math.max(0, Math.min(100, percent))}%`,
+                    background: theme.info.text,
+                    borderRadius: "3px",
+                    transition: indeterminate ? "none" : "width 0.4s ease",
+                    animation: indeterminate ? "cu-indeterminate 1.4s ease-in-out infinite" : "none",
+                } })] }));
+}
 // Live view of the running pacman transaction, fed from the log tail the
 // backend parses on every status poll.
+//
+// Deliberately not ProgressBarWithInfo: that component is a Steam Field, and
+// a Field puts its child in the right-hand value column next to an (empty)
+// label column, which pushed the bar far to the right. Its ItemProps
+// `layout` prop is not the Field's `childrenLayout`, so it had no effect.
+// Steam's raw ProgressBar in a full-width div sidesteps the Field entirely;
+// the operation text and counts are rendered by us.
 function UpgradeProgress({ upgrade }) {
     const p = upgrade.progress;
     const percent = p?.percent ?? 0;
+    const indeterminate = percent <= 2;
     const label = p?.label ?? "Starting";
     const counts = p && p.total > 0
         ? p.phase === "download"
@@ -411,7 +441,15 @@ function UpgradeProgress({ upgrade }) {
                     : `${p.total} packages`
         : "";
     const elapsed = upgrade.started_at ? formatDuration(Math.floor(Date.now() / 1000) - upgrade.started_at) : "";
-    return (SP_JSX.jsxs(DFL.PanelSection, { title: "System update in progress", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ProgressBarWithInfo, { layout: "below", nProgress: percent, indeterminate: percent <= 2, sOperationText: label, sTimeRemaining: counts, bottomSeparator: "none" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.muted, wordBreak: "break-word" }, children: [p?.last_line ? p.last_line : "Waiting for pacman output...", elapsed ? SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx("br", {}), "Running for ", elapsed, ". Sleep is blocked until it finishes."] }) : null] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.dim }, children: "The update runs as its own system service - closing this menu, restarting Steam or Decky won't interrupt it." }) })] }));
+    return (SP_JSX.jsxs(DFL.PanelSection, { title: "System update in progress", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { width: "100%", boxSizing: "border-box", padding: "4px 0" }, children: [SP_JSX.jsxs("div", { style: {
+                                display: "flex",
+                                justifyContent: "space-between",
+                                alignItems: "baseline",
+                                gap: "8px",
+                                marginBottom: "6px",
+                                fontSize: theme.fontSize.body,
+                                color: theme.text.primary,
+                            }, children: [SP_JSX.jsx("span", { style: { overflowWrap: "anywhere" }, children: label }), counts ? (SP_JSX.jsx("span", { style: { flexShrink: 0, fontSize: theme.fontSize.small, color: theme.text.secondary }, children: indeterminate ? counts : `${counts} · ${Math.round(percent)}%` })) : !indeterminate ? (SP_JSX.jsxs("span", { style: { flexShrink: 0, fontSize: theme.fontSize.small, color: theme.text.secondary }, children: [Math.round(percent), "%"] })) : null] }), SP_JSX.jsx("div", { style: { width: "100%" }, children: DFL.ProgressBar ? (SP_JSX.jsx(DFL.ProgressBar, { nProgress: percent, indeterminate: indeterminate, focusable: false })) : (SP_JSX.jsx(FallbackBar, { percent: percent, indeterminate: indeterminate })) })] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.muted, wordBreak: "break-word" }, children: [p?.last_line ? p.last_line : "Waiting for pacman output...", elapsed ? SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx("br", {}), "Running for ", elapsed, ". Sleep is blocked until it finishes."] }) : null] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.dim }, children: "The update runs as its own system service - closing this menu, restarting Steam or Decky won't interrupt it." }) })] }));
 }
 
 // Everything the user sees after a run ended: the result banner with the
