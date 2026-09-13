@@ -29,6 +29,7 @@ export function UpgradeProgress({ upgrade }: UpgradeProgressProps) {
     <PanelSection title="System update in progress">
       <PanelSectionRow>
         <ProgressBarWithInfo
+          layout="below"
           nProgress={percent}
           indeterminate={percent <= 2}
           sOperationText={label}
